@@ -10,6 +10,7 @@
  * 1.0.4 - configuration options moved to file
  * 1.0.5 - added logstash api + bugfix in readResponse
  * 1.0.6 - added index_freq option
+ * 1.1.0 - moved to nlohmann/json library
 */
 #define _XOPEN_SOURCE 700 // POSIX 2008
 #include <iostream>
@@ -38,10 +39,19 @@
 #include <math.h>
 #include <openssl/ssl.h>
 
+#include "json.hpp"
+
 #define IP_MAX      16
 #define BUFFER      1024
 #define MIN_PORT    1
 #define MAX_PORT    65535
+
+using json = nlohmann::json;
+
+enum severity {
+    INFO,
+    ERROR
+};
 
 /*** OS METRICS USING LINUX/POSIX LIBRARIES ***/
 // returns associative array with hostname and ip address of this machine
@@ -74,6 +84,32 @@ std::unordered_map<std::string, std::string> systemd_service_status(const std::s
 /********************************/
 /********************************/
 /*** GENERIC HELPER FUNCTIONS ***/
+int writeToLog(const severity s, const char *filename, const char *message)
+{
+        FILE *logFile = fopen(filename, "a");
+        if(logFile == NULL){fprintf(stderr, "cannot open log file\n");return -1;}
+        struct tm *timeinfo;
+        time_t rawtime = time(NULL);
+
+        // stores time information
+        char time_buffer[20];
+
+        timeinfo = localtime(&rawtime);
+        strftime(time_buffer, sizeof(time_buffer), "%d-%m-%Y %H:%M:%S", timeinfo);
+        switch(s)
+        {
+            case INFO:
+                fprintf(logFile, "%s: [INFO]%s\n", time_buffer, message);
+            break;
+            case ERROR:
+                fprintf(logFile, "%s: [ERROR]%s\n", time_buffer, message);
+            break;
+        }
+
+        fclose(logFile);
+        return 0;
+}
+
 int getCommandOutput(const std::string &command, std::string &output)
 {
     FILE *f = NULL;
@@ -271,6 +307,24 @@ int sendData(const char *data, const char *host, unsigned short port)
 	return status_code;
 }
 
+std::string mergeJsonIntoOne(const std::string &j1, const std::string &j2)
+{
+    std::string s1 = j1;
+    std::string s2 = j2;
+    if(s1.back() == '}' && s2.front() == '{')
+    {
+        s1.back() = ',';
+        s2.front() = ' ';
+    }
+    else
+    {
+        if(!j1.empty())
+            return s1;
+    }
+
+    return s1 + s2;
+}
+
 int sendDataToElasticsearch(const std::string &data, const std::string &index, const std::string &type, const std::string &base64, const char *host, unsigned short port)
 {
     // ISO8601 UTC timestamp
@@ -279,32 +333,28 @@ int sendDataToElasticsearch(const std::string &data, const std::string &index, c
 	char timestamp[30];
 	timeinfo = gmtime(&rawtime);
 	strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
-    std::string data_str = data;
-    data_str.pop_back();
-    std::string elastic_data = data_str + ",\"@timestamp\": " + "\"" + timestamp + "\"}\n";
+    std::string timestamp_json = "{\"@timestamp\": \"" + std::string(timestamp) + "\"}";
+    std::string elastic_data = mergeJsonIntoOne(data, timestamp_json);
 
-
-    std::string elastic_request = "POST /" + index + "/" + type + " HTTP/1.0\r\n" +
-	"Content-type: application/json\r\n" +
-    "Authorization: Basic " + base64 + "\r\n" +
-	"Content-length: " + std::to_string(elastic_data.size()) + "\r\n\r\n" +
-	elastic_data;
+    std::string elastic_request;
+    if(base64.empty())
+    {
+        elastic_request = "POST /" + index + "/" + type + " HTTP/1.0\r\n" +
+	    "Content-type: application/json\r\n" +
+	    "Content-length: " + std::to_string(elastic_data.size()) + "\r\n\r\n" +
+	    elastic_data;
+    }
+    else
+    {
+        elastic_request = "POST /" + index + "/" + type + " HTTP/1.0\r\n" +
+	    "Content-type: application/json\r\n" +
+        "Authorization: Basic " + base64 + "\r\n" +
+	    "Content-length: " + std::to_string(elastic_data.size()) + "\r\n\r\n" +
+	    elastic_data;
+    }
 
     std::cout << elastic_request << std::endl;
     return sendData(elastic_request.c_str(), host, port);
-}
-
-const char *extract_json_value(const char *response, const char **json_key, int levels)
-{
-    const char *value;
-    int index = 1;
-    if((value = strstr(response, json_key[0])) == NULL) return NULL;
-    for(; index < levels; index++)
-    {
-        if((value = strstr(value, json_key[index])) == NULL) return NULL;
-    }
-    value += strlen(json_key[index - 1]);
-    return value;
 }
 
 template<typename T>
@@ -388,36 +438,45 @@ std::string &operator+(std::string &sum, const std::unordered_map<std::string, T
 }
 template std::string &operator+(std::string &sum, const std::unordered_map<std::string, std::string> &map);
 template std::string &operator+(std::string &sum, const std::unordered_map<std::string, uint64_t> &map);
-/*** END OF GENERIC HELPER FUNCTIONS ***/
-/***************************************/
-/***************************************/
 
 
-/***************************************/
-/***************************************/
-/*********** NODE BASE CLASS ***********/
-// methods common for both node and cluster stats
+
+
+
 class Node
 {
     int master_node_ip();
 
     protected:
+    const char *msg;
+    const char *logFile;
     std::string masterNodeIP;
     std::string nodeIP;
     std::string nodeHostname;
-    std::string base64auth;
     const char *elasticsearchIP;
     unsigned short elasticsearchPort;
+    std::string base64auth;
     std::unordered_map<std::string, std::string> api_timestamp(const char *);
 
     public:
-    Node(const std::string &_base64auth, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort): base64auth(_base64auth), elasticsearchIP(_elasticsearchIP.c_str()), elasticsearchPort(_elasticsearchPort)
+    Node(const std::string &_logFile, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort, const std::string &_base64auth): logFile(_logFile.c_str()), elasticsearchIP(_elasticsearchIP.c_str()), elasticsearchPort(_elasticsearchPort)
     {
+        if(!_base64auth.empty())
+            base64auth = _base64auth;
+
         if(node_hostname_ip(nodeHostname, nodeIP) == -1)
-            throw std::runtime_error("Failed to construct Node object: Hostname/IP unknown");
+        {
+            msg = "Failed to construct Node object: Hostname/IP unknown";
+            writeToLog(ERROR, logFile, msg);
+            throw std::runtime_error(msg);
+        }
         if(master_node_ip() == -1)
-            throw std::runtime_error("Failed to construct Node object: Unable to determine master node");
-    };
+        {
+            msg = "Failed to construct Node object: Unable to determine master node";
+            writeToLog(ERROR, logFile, msg);
+            throw std::runtime_error(msg);
+        }
+    }
 };
 
 std::unordered_map<std::string, std::string> Node::api_timestamp(const char *response)
@@ -443,7 +502,12 @@ std::unordered_map<std::string, std::string> Node::api_timestamp(const char *res
 
 int Node::master_node_ip()
 {
-    std::string elastic_request = "GET /_cat/master HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+    std::string elastic_request;
+    if(!base64auth.empty())
+        elastic_request = "GET /_cat/master HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+    else
+        elastic_request = "GET /_cat/master HTTP/1.0\r\nContent-type: application/json\r\n\r\n";
+
     const char *response = readResponse(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
     if(response == NULL) return -1;
     if(getHttpStatus(response) != 200) return -1;
@@ -456,856 +520,395 @@ int Node::master_node_ip()
     free((char *)response);
     return 0;
 }
-/******* END OF NODE BASE CLASS *******/
-/**************************************/
-/**************************************/
 
 
-/**************************************/
-/**************************************/
-/********* CLUSTER API CLASS **********/
+
+
+
 class ClusterStats : private Node
 {
     const char *api_response;
     const char *api_health_response;
+    std::string stats;
 
-    std::unordered_map<std::string, uint64_t> api_stats();
-    std::unordered_map<std::string, float> api_health();
+    void api_stats();
+    void api_health();
 
     public:
-    ClusterStats(const std::string &_base64auth, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort): Node(_base64auth, _elasticsearchIP, _elasticsearchPort)
+    ClusterStats(const std::string &_logFile, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort, const std::string &_base64auth): Node(_logFile, _elasticsearchIP, _elasticsearchPort, _base64auth)
+    {
+        api_response = NULL;
+        api_health_response = NULL;
+        const char *stats_request = NULL;
+        const char *health_request = NULL;
+
+        if(base64auth.empty())
+        {
+            stats_request = "GET /_cluster/stats HTTP/1.0\r\nContent-type: application/json\r\n\r\n";
+            health_request = "GET /_cluster/health HTTP/1.0\r\nContent-type: application/json\r\n\r\n";
+        }
+        else
+        {
+            stats_request = std::string("GET /_cluster/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n").c_str();
+            health_request = std::string("GET /_cluster/health HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n").c_str();
+        }
+
+        init(stats_request, health_request);
+    }
+    void init(const char *stats_request, const char *health_request)
     {
         if(nodeIP != masterNodeIP)
-            throw std::runtime_error("Failed to construct ClusterStats object: It is not a master node");
+        {
+            msg = "Unable to construct ClusterStats object: It is not a master node";
+            writeToLog(INFO, logFile, msg);
+            throw std::runtime_error(msg);
+        }
 
-        std::string elastic_request = "GET /_cluster/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-        api_response = readResponse(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
-        elastic_request = "GET /_cluster/health HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-	    api_health_response = readResponse(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
+        api_response = readResponse(stats_request, elasticsearchIP, elasticsearchPort);
+	    api_health_response = readResponse(health_request, elasticsearchIP, elasticsearchPort);
         if(api_response == NULL || api_health_response == NULL)
-            throw std::runtime_error("Failed to construct ClusterStats object: NULL response");
-    };
+        {
+            msg = "Failed to construct ClusterStats object: NULL response";
+            writeToLog(ERROR, logFile, msg);
+            throw std::runtime_error(msg);
+        }
+
+        if(getHttpStatus(api_response) != 200)
+        {
+            msg = "Failed to construct ClusterStats object: Got != 200 status code when requesting _cluster/stats";
+            writeToLog(ERROR, logFile, msg);
+            throw std::runtime_error(msg);
+        }
+
+        if(getHttpStatus(api_health_response) != 200)
+        {
+            msg = "Failed to construct ClusterStats object: Got != 200 status code when requesting _cluster/health";
+            writeToLog(ERROR, logFile, msg);
+            throw std::runtime_error(msg);
+        }
+
+        api_response = remove_headers((char **)&api_response);
+        api_health_response = remove_headers((char **)&api_health_response);
+    }
     ~ClusterStats(){free((char *)api_response); free((char *)api_health_response);};
 
     std::string get_api_stats()
     {
-        std::string json_output;
-        json_output = json_output + api_timestamp(api_response) + hostname_ip() + api_stats() + api_health();
+        api_health();
+        api_stats();
+        stats = mergeJsonIntoOne(stats, json(api_timestamp(api_response)).dump());
+        stats = mergeJsonIntoOne(stats, json(hostname_ip()).dump());
 
-        return json_output;
+        return stats;
     };
 };
 
-std::unordered_map<std::string, float> ClusterStats::api_health()
+void ClusterStats::api_health()
 {
-    std::unordered_map<std::string, float> stats;
-    if(getHttpStatus(api_health_response) != 200) return stats;
-    api_health_response = remove_headers((char **)&api_health_response);
+    try
+    {
+        json response = json::parse(api_health_response);
 
-    const char *value = NULL;
-    union Key{const char *key[1];};
-    Key key;
-
-    key = {"active_shards_percent_as_number\":"};
-    if((value = extract_json_value(api_health_response, key.key, 1)) == NULL) return stats;
-    float availability = strtof(value, NULL);
-    stats.insert({"cluster_stats_availability", availability});
-
-    return stats;
+        json obj;
+        for (auto &e: response.items())
+        {
+            obj["cluster_health_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
+    }
+    catch(json::parse_error& e)
+    {
+        writeToLog(ERROR, logFile, e.what());
+    }
 }
-std::unordered_map<std::string, uint64_t> ClusterStats::api_stats()
+
+void ClusterStats::api_stats()
 {
-    std::unordered_map<std::string, uint64_t> stats;
-    if(getHttpStatus(api_response) != 200) return stats;
-    api_response = remove_headers((char **)&api_response);
-    const char *value = NULL;
-    union Key{const char *keys[5];};
-    Key keys;
+    try
+    {
+        json response = json::parse(api_response);
 
-    keys = {"nodes\":", "count\":", "total\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t nodes_count_total = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_count_total", nodes_count_total});
+        json obj;
+        for (auto &e: response["indices"]["shards"]["index"]["shards"].items())
+        {
+            obj["cluster_stats_indices_shards_index_shards_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
-    keys = {"nodes\":", "os\":", "mem\":", "total_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t nodes_os_mem_total_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_os_mem_total_in_bytes", nodes_os_mem_total_in_bytes});
 
-    keys = {"nodes\":", "jvm\":", "mem\":", "heap_used_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t nodes_jvm_mem_heap_used_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_jvm_mem_heap_used_in_bytes", nodes_jvm_mem_heap_used_in_bytes});
 
-    keys = {"nodes\":", "jvm\":", "mem\":", "heap_max_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t nodes_jvm_mem_heap_max_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_jvm_mem_heap_max_in_bytes", nodes_jvm_mem_heap_max_in_bytes});
+        obj.clear();
+        for (auto &e: response["indices"]["shards"]["index"]["primaries"].items())
+        {
+            obj["cluster_stats_indices_shards_index_primaries_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
 
 
+        obj.clear();
+        for (auto &e: response["indices"]["shards"]["index"]["replication"].items())
+        {
+            obj["cluster_stats_indices_shards_index_replication_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
-    keys = {"indices\":", "count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t indices_count = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_count", indices_count});
 
-    keys = {"indices\":", "shards\":", "total\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_shards_total = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_shards_total", indices_shards_total});
 
-    keys = {"indices\":", "shards\":", "index\":", "shards\":", "min\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t indices_shards_index_shards_min = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_shards_index_shards_min", indices_shards_index_shards_min});
+        obj.clear();
+        for (auto &e: response["indices"]["docs"].items())
+        {
+            obj["cluster_stats_indices_docs_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
-    keys = {"indices\":", "shards\":", "index\":", "shards\":", "max\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t indices_shards_index_shards_max = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_shards_index_shards_max", indices_shards_index_shards_max});
 
-    keys = {"indices\":", "shards\":", "index\":", "primaries\":", "min\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t indices_shards_index_primaries_min = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_shards_index_primaries_min", indices_shards_index_primaries_min});
 
-    keys = {"indices\":", "shards\":", "index\":", "primaries\":", "max\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t indices_shards_index_primaries_max = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_shards_index_primaries_max", indices_shards_index_primaries_max});
+        obj.clear();
+        for (auto &e: response["indices"]["store"].items())
+        {
+            obj["cluster_stats_indices_store_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
-    keys = {"indices\":", "shards\":", "index\":", "replication\":", "min\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t indices_shards_index_replication_min = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_shards_index_replication_min", indices_shards_index_replication_min});
 
-    keys = {"indices\":", "shards\":", "index\":", "replication\":", "max\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t indices_shards_index_replication_max = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_shards_index_replication_max", indices_shards_index_replication_max});
 
+        obj.clear();
+        for (auto &e: response["indices"]["fielddata"].items())
+        {
+            obj["cluster_stats_indices_fielddata_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
 
 
-    keys = {"indices\":", "docs\":", "count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_docs_count = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_docs_count", indices_docs_count});
+        obj.clear();
+        for (auto &e: response["indices"]["query_cache"].items())
+        {
+            obj["cluster_stats_indices_query_cache_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
-    keys = {"indices\":", "docs\":", "deleted\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_docs_deleted = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_docs_deleted", indices_docs_deleted});
 
 
+        obj.clear();
+        for (auto &e: response["indices"]["completion"].items())
+        {
+            obj["cluster_stats_indices_completion_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
 
-    keys = {"indices\":", "store\":", "size_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_store_size_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_store_size_in_bytes", indices_store_size_in_bytes});
 
-    keys = {"indices\":", "store\":", "throttle_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_store_throttle_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_store_throttle_time_in_millis", indices_store_throttle_time_in_millis});
+        obj.clear();
+        for (auto &e: response["indices"]["segments"].items())
+        {
+            obj["cluster_stats_indices_segments_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
 
 
+        obj.clear();
+        for (auto &e: response["nodes"]["os"]["mem"].items())
+        {
+            obj["cluster_stats_nodes_os_mem_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
-    keys = {"indices\":", "fielddata\":", "memory_size_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_fielddata_memory_size_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_fielddata_memory_size_in_bytes", indices_fielddata_memory_size_in_bytes});
-
-    keys = {"indices\":", "fielddata\":", "evictions\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t cluster_stats_indices_fielddata_evictions = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_fielddata_evictions", cluster_stats_indices_fielddata_evictions});
 
 
+        obj.clear();
+        for (auto &e: response["nodes"]["process"]["cpu"].items())
+        {
+            obj["cluster_stats_nodes_process_cpu_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
 
-    keys = {"indices\":", "query_cache\":", "memory_size_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_query_cache_memory_size_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_query_cache_memory_size_in_bytes", indices_query_cache_memory_size_in_bytes});
 
-    keys = {"indices\":", "query_cache\":", "total_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_query_cache_total_count = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_query_cache_total_count", indices_query_cache_total_count});
+        obj.clear();
+        for (auto &e: response["nodes"]["process"]["open_file_descriptors"].items())
+        {
+            obj["cluster_stats_nodes_process_open_file_descriptors_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
-    keys = {"indices\":", "query_cache\":", "hit_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_query_cache_hit_count = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_query_cache_hit_count", indices_query_cache_hit_count});
 
-    keys = {"indices\":", "query_cache\":", "miss_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_query_cache_miss_count = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_query_cache_miss_count", indices_query_cache_miss_count});
 
-    keys = {"indices\":", "query_cache\":", "cache_size\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_query_cache_cache_size = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_query_cache_cache_size", indices_query_cache_cache_size});
+        obj.clear();
+        for (auto &e: response["nodes"]["jvm"]["mem"].items())
+        {
+            obj["cluster_stats_nodes_jvm_mem_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
 
-    keys = {"indices\":", "query_cache\":", "cache_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_query_cache_cache_count = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_query_cache_cache_count", indices_query_cache_cache_count});
 
-    keys = {"indices\":", "query_cache\":", "evictions\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_query_cache_evictions = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_query_cache_evictions", indices_query_cache_evictions});
 
-
-
-
-    keys = {"indices\":", "segments\":", "count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_count = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_count", indices_segments_count});
-
-    keys = {"indices\":", "segments\":", "memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_memory_in_bytes", indices_segments_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "terms_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_terms_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_terms_memory_in_bytes", indices_segments_terms_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "stored_fields_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_stored_fields_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_stored_fields_memory_in_bytes", indices_segments_stored_fields_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "term_vectors_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_term_vectors_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_term_vectors_memory_in_bytes", indices_segments_term_vectors_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "norms_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_norms_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_norms_memory_in_bytes", indices_segments_norms_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "doc_values_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_doc_values_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_doc_values_memory_in_bytes", indices_segments_doc_values_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "index_writer_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_index_writer_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_index_writer_memory_in_bytes", indices_segments_index_writer_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "index_writer_max_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_index_writer_max_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_index_writer_max_memory_in_bytes", indices_segments_index_writer_max_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "version_map_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_version_map_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_version_map_memory_in_bytes", indices_segments_version_map_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "fixed_bit_set_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_fixed_bit_set_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_indices_segments_fixed_bit_set_memory_in_bytes", indices_segments_fixed_bit_set_memory_in_bytes});
-
-
-
-
-    keys = {"nodes\":", "os\":", "available_processors\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t nodes_os_available_processors = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_os_available_processors", nodes_os_available_processors});
-
-    keys = {"nodes\":", "os\":", "allocated_processors\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t nodes_os_allocated_processors = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_os_allocated_processors", nodes_os_allocated_processors});
-
-
-
-
-    keys = {"nodes\":", "process\":", "cpu\":", "percent\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t nodes_process_cpu_percent = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_process_cpu_percent", nodes_process_cpu_percent});
-
-    keys = {"nodes\":", "process\":", "open_file_descriptors\":", "min\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t nodes_process_open_file_descriptors_min = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_process_open_file_descriptors_min", nodes_process_open_file_descriptors_min});
-
-    keys = {"nodes\":", "process\":", "open_file_descriptors\":", "max\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t nodes_process_open_file_descriptors_max = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_process_open_file_descriptors_max", nodes_process_open_file_descriptors_max});
-
-
-
-
-    keys = {"nodes\":", "fs\":", "total_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t nodes_fs_total_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_fs_total_in_bytes", nodes_fs_total_in_bytes});
-
-    keys = {"nodes\":", "fs\":", "free_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t nodes_fs_free_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"cluster_stats_nodes_fs_free_in_bytes", nodes_fs_free_in_bytes});
-
-    return stats;
+        obj.clear();
+        for (auto &e: response["nodes"]["fs"].items())
+        {
+            obj["cluster_stats_nodes_fs_" + e.key()] = e.value();
+        }
+        stats = mergeJsonIntoOne(stats, obj.dump());
+    }
+    catch(json::parse_error& e)
+    {
+        writeToLog(ERROR, logFile, e.what());
+    }
 }
-/****** END OF CLUSTER API CLASS ******/
-/**************************************/
-/**************************************/
 
 
-/**************************************/
-/**************************************/
-/*********** NODE API CLASS ***********/
+
+
+
 class NodeStats : private Node
 {
-    // API
     const char *api_response;
 
-    std::unordered_map<std::string, uint64_t> api_stats();
+    json api_stats();
 
     public:
-        NodeStats(const std::string &_base64auth, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort): Node(_base64auth, _elasticsearchIP, _elasticsearchPort)
+        NodeStats(const std::string &_logFile, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort, const std::string &_base64auth): Node(_logFile, _elasticsearchIP, _elasticsearchPort, _base64auth)
         {
-            const std::string elastic_request = "GET /_nodes/" + nodeIP + "/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-            api_response = readResponse(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
+            api_response = NULL;
+            const char *stats_request = NULL;
+
+            if(base64auth.empty())
+                stats_request = std::string("GET /_nodes/" + nodeIP + "/stats HTTP/1.0\r\nContent-type: application/json\r\n\r\n").c_str();
+            else
+                stats_request = std::string("GET /_nodes/" + nodeIP + "/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n").c_str();
+
+            init(stats_request);
+        };
+        void init(const char *stats_request)
+        {
+            api_response = readResponse(stats_request, elasticsearchIP, elasticsearchPort);
             if(api_response == NULL)
-                throw std::runtime_error("Failed to construct NodeStats object: NULL response");
+            {
+                msg = "Failed to construct NodeStats object: NULL response";
+                writeToLog(ERROR, logFile, msg);
+                throw std::runtime_error(msg);
+            }
+            if(getHttpStatus(api_response) != 200)
+            {
+                msg = "Failed to construct NodeStats object: Got != 200 status code when requesting _nodes/stats";
+                writeToLog(ERROR, logFile, msg);
+                throw std::runtime_error(msg);
+            }
+
+            api_response = remove_headers((char **)&api_response);
         };
         ~NodeStats(){free((char *)api_response);};
 
         std::string get_api_stats()
         {
-            std::string json_output;
-            json_output = json_output + api_timestamp(api_response) + hostname_ip() + api_stats();
+            json j = {};
+            j += api_stats();
+            //for(auto& i: j.items())
+            //{}
 
-            return json_output;
+            std::string output;
+            output = output + api_timestamp(api_response) + hostname_ip() + j.dump();
+            return output;
         };
 };
 
-std::unordered_map<std::string, uint64_t> NodeStats::api_stats()
+json NodeStats::api_stats()
 {
-    std::unordered_map<std::string, uint64_t> stats;
-    if(getHttpStatus(api_response) != 200) return stats;
-    api_response = remove_headers((char **)&api_response);
-    const char *value = NULL;
-    union Key{const char *keys[5];};
-    Key keys;
-
-    keys = {"indices\":", "docs\":", "count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_docs_count = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_docs_count", indices_docs_count});
-
-    keys = {"indices\":", "docs\":", "deleted\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_docs_deleted = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_docs_deleted", indices_docs_deleted});
-
-    keys = {"indices\":", "store\":", "size_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_store_size_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_store_size_in_bytes", indices_store_size_in_bytes});
-
-    keys = {"indices\":", "store\":", "throttle_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_store_throttle_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_store_throttle_time_in_millis", indices_store_throttle_time_in_millis});
-
-    keys = {"indices\":", "indexing\":", "index_total\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_indexing_index_total = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_index_total", indices_indexing_index_total});
-
-    keys = {"indices\":", "indexing\":", "index_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_indexing_index_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_index_time_in_millis", indices_indexing_index_time_in_millis});
-
-    keys = {"indices\":", "indexing\":", "index_current\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_indexing_index_current = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_index_current", indices_indexing_index_current});
-
-    keys = {"indices\":", "indexing\":", "index_failed\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_indexing_index_failed = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_index_failed", indices_indexing_index_failed});
-
-    keys = {"indices\":", "indexing\":", "delete_total\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_indexing_delete_total = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_delete_total", indices_indexing_delete_total});
-
-    keys = {"indices\":", "indexing\":", "delete_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_indexing_delete_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_delete_time_in_millis", indices_indexing_delete_time_in_millis});
-
-    keys = {"indices\":", "indexing\":", "delete_current\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_indexing_delete_current = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_delete_current", indices_indexing_delete_current});
-
-    keys = {"indices\":", "indexing\":", "noop_update_total\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_indexing_noop_update_total = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_noop_update_total", indices_indexing_noop_update_total});
-
-    keys = {"indices\":", "indexing\":", "is_throttled\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    char bool_max[6];
-    size_t bool_size = strcspn(value, ",");
-    snprintf(bool_max, bool_size + 1, "%s", value);
-    uint64_t indices_indexing_is_throttled = (std::string(bool_max) == "true") ? 1 : 0;
-    stats.insert({"node_stats_indices_indexing_is_throttled", indices_indexing_is_throttled});
-
-    keys = {"indices\":", "indexing\":", "throttle_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t node_stats_indices_indexing_throttle_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_indexing_throttle_time_in_millis", node_stats_indices_indexing_throttle_time_in_millis});
-
-    keys = {"indices\":", "search\":", "open_contexts\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_open_contexts = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_open_contexts", indices_search_open_contexts});
-
-    keys = {"indices\":", "search\":", "query_total\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_query_total = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_query_total", indices_search_query_total});
-
-    keys = {"indices\":", "search\":", "query_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_query_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_query_time_in_millis", indices_search_query_time_in_millis});
-
-    keys = {"indices\":", "search\":", "query_current\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_query_current = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_query_current", indices_search_query_current});
-
-    keys = {"indices\":", "search\":", "fetch_total\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_fetch_total = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_fetch_total", indices_search_fetch_total});
-
-    keys = {"indices\":", "search\":", "fetch_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_fetch_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_fetch_time_in_millis", indices_search_fetch_time_in_millis});
-
-    keys = {"indices\":", "search\":", "fetch_current\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_fetch_current = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_fetch_current", indices_search_fetch_current});
-
-    keys = {"indices\":", "search\":", "scroll_total\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_scroll_total = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_scroll_total", indices_search_scroll_total});
-
-    keys = {"indices\":", "search\":", "scroll_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_scroll_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_scroll_time_in_millis", indices_search_scroll_time_in_millis});
-
-    keys = {"indices\":", "search\":", "scroll_current\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_search_scroll_current = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_search_scroll_current", indices_search_scroll_current});
-
-    keys = {"indices\":", "segments\":", "count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_count = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_count", indices_segments_count});
-
-    keys = {"indices\":", "segments\":", "memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_memory_in_bytes", indices_segments_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "terms_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_terms_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_terms_memory_in_bytes", indices_segments_terms_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "stored_fields_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_stored_fields_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_stored_fields_memory_in_bytes", indices_segments_stored_fields_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "term_vectors_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_term_vectors_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_term_vectors_memory_in_bytes", indices_segments_term_vectors_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "norms_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_norms_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_norms_memory_in_bytes", indices_segments_norms_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "doc_values_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_doc_values_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_doc_values_memory_in_bytes", indices_segments_doc_values_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "index_writer_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_index_writer_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_index_writer_memory_in_bytes", indices_segments_index_writer_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "index_writer_max_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_index_writer_max_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_index_writer_max_memory_in_bytes", indices_segments_index_writer_max_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "version_map_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_version_map_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_version_map_memory_in_bytes", indices_segments_version_map_memory_in_bytes});
-
-    keys = {"indices\":", "segments\":", "fixed_bit_set_memory_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t indices_segments_fixed_bit_set_memory_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_indices_segments_fixed_bit_set_memory_in_bytes", indices_segments_fixed_bit_set_memory_in_bytes});
-
-
-
-
-    keys = {"os\":", "cpu_percent\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t os_cpu_percent = strtol(value, NULL, 0);
-    stats.insert({"node_stats_os_cpu_percent", os_cpu_percent});
-
-    keys = {"os\":", "mem\":", "total_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t os_mem_total_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_os_mem_total_in_bytes", os_mem_total_in_bytes});
-
-    keys = {"os\":", "mem\":", "free_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t os_mem_free_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_os_mem_free_in_bytes", os_mem_free_in_bytes});
-
-    keys = {"os\":", "swap\":", "total_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t os_swap_total_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_os_swap_total_in_bytes", os_swap_total_in_bytes});
-
-    keys = {"os\":", "swap\":", "free_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t os_swap_free_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_os_swap_free_in_bytes", os_swap_free_in_bytes});
-
-
-
-
-    keys = {"process\":", "open_file_descriptors\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t process_open_file_descriptors = strtol(value, NULL, 0);
-    stats.insert({"node_stats_process_open_file_descriptors", process_open_file_descriptors});
-
-    keys = {"process\":", "max_file_descriptors\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t process_max_file_descriptors = strtol(value, NULL, 0);
-    stats.insert({"node_stats_process_max_file_descriptors", process_max_file_descriptors});
-
-    keys = {"process\":", "cpu\":", "percent\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t process_cpu_percent = strtol(value, NULL, 0);
-    stats.insert({"node_stats_process_cpu_percent", process_cpu_percent});
-
-    keys = {"process\":", "mem\":", "total_virtual_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t process_mem_total_virtual_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_process_mem_total_virtual_in_bytes", process_mem_total_virtual_in_bytes});
-
-
-
-
-    keys = {"jvm\":", "mem\":", "heap_used_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t jvm_mem_heap_used_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_jvm_mem_heap_used_in_bytes", jvm_mem_heap_used_in_bytes});
-
-    keys = {"jvm\":", "mem\":", "heap_used_percent\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t jvm_mem_heap_used_percent = strtol(value, NULL, 0);
-    stats.insert({"node_stats_jvm_mem_heap_used_percent", jvm_mem_heap_used_percent});
-
-    keys = {"jvm\":", "gc\":", "collectors\":", "young\":", "collection_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t jvm_gc_collectors_young_collection_count = strtol(value, NULL, 0);
-    stats.insert({"node_stats_jvm_gc_collectors_young_collection_count", jvm_gc_collectors_young_collection_count});
-
-    keys = {"jvm\":", "gc\":", "collectors\":", "young\":", "collection_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t jvm_gc_collectors_young_collection_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_jvm_gc_collectors_young_collection_time_in_millis", jvm_gc_collectors_young_collection_time_in_millis});
-
-    keys = {"jvm\":", "gc\":", "collectors\":", "old\":", "collection_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t jvm_gc_collectors_old_collection_count = strtol(value, NULL, 0);
-    stats.insert({"node_stats_jvm_gc_collectors_old_collection_count", jvm_gc_collectors_old_collection_count});
-
-    keys = {"jvm\":", "gc\":", "collectors\":", "old\":", "collection_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 5)) == NULL) return stats;
-    uint64_t jvm_gc_collectors_old_collection_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"node_stats_jvm_gc_collectors_old_collection_time_in_millis", jvm_gc_collectors_old_collection_time_in_millis});
-
-    keys = {"jvm\":", "mem\":", "heap_max_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t jvm_mem_heap_max_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_jvm_mem_heap_max_in_bytes", jvm_mem_heap_max_in_bytes});
-
-
-
-
-    keys = {"thread_pool\":", "bulk\":", "rejected\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t thread_pool_bulk_rejected = strtol(value, NULL, 0);
-    stats.insert({"node_stats_thread_pool_bulk_rejected", thread_pool_bulk_rejected});
-
-    keys = {"thread_pool\":", "index\":", "rejected\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t thread_pool_index_rejected = strtol(value, NULL, 0);
-    stats.insert({"node_stats_thread_pool_index_rejected", thread_pool_index_rejected});
-
-    keys = {"thread_pool\":", "search\":", "rejected\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t thread_pool_search_rejected = strtol(value, NULL, 0);
-    stats.insert({"node_stats_thread_pool_search_rejected", thread_pool_search_rejected});
-
-
-
-
-    keys = {"fs\":", "total\":", "total_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t fs_total_total_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_fs_total_total_in_bytes", fs_total_total_in_bytes});
-
-    keys = {"fs\":", "total\":", "free_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t fs_total_free_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"node_stats_fs_total_free_in_bytes", fs_total_free_in_bytes});
-
-    return stats;
+    json parsed_response = {};
+    const char *beg_str = "\"nodes\":{\"";
+    const char *ptr = strstr(api_response, beg_str);
+    if(ptr == NULL) return parsed_response;
+
+    ptr += strlen(beg_str);
+    size_t nodeId_s = strcspn(ptr, "\"");
+    char *nodeId = (char *)calloc(nodeId_s + 1, sizeof(char));
+    if(nodeId == NULL) return parsed_response;
+    strncpy(nodeId, ptr, nodeId_s);
+
+    try
+    {
+        json response = json::parse(api_response);
+        parsed_response += response["nodes"][nodeId]["indices"];
+    }
+    catch(json::parse_error& e)
+    {
+        writeToLog(ERROR, logFile, e.what());
+    }
+
+    free(nodeId);
+    return parsed_response;
 }
-/******** END OF NODE API CLASS ********/
-/***************************************/
-/***************************************/
 
-/**************************************/
-/**************************************/
-/********* LOGSTASH API CLASS *********/
+
+
+
 
 class LogstashStats
 {
-    // API
+    const char *msg;
+    const char *logFile;
     const char *api_response;
     const char *logstashIP;
     unsigned short logstashPort;
 
-    std::unordered_map<std::string, uint64_t> api_stats();
-    std::unordered_map<std::string, float> cpu_load();
+    json api_stats();
 
     public:
-        LogstashStats(const std::string &_logstashIP, unsigned short _logstashPort): logstashIP(_logstashIP.c_str()), logstashPort(_logstashPort)
+        LogstashStats(const std::string &_logFile, const std::string &_logstashIP, unsigned short _logstashPort): logFile(_logFile.c_str()), logstashIP(_logstashIP.c_str()), logstashPort(_logstashPort)
         {
-            const std::string logstash_request = "GET /_node/stats/?human=false HTTP/1.0\r\nContent-type: application/json\r\n\r\n";
-            api_response = readResponse(logstash_request.c_str(), logstashIP, logstashPort);
+            const char *stats_request = "GET /_node/stats/?human=false HTTP/1.0\r\nContent-type: application/json\r\n\r\n";
+            api_response = readResponse(stats_request, logstashIP, logstashPort);
             if(api_response == NULL)
-                throw std::runtime_error("Failed to construct LogstashStats object: NULL response");
+            {
+                msg = "Failed to construct LogstashStats object: NULL response";
+                writeToLog(ERROR, logFile, msg);
+                throw std::runtime_error(msg);
+            }
             if(getHttpStatus(api_response) != 200)
-                throw std::runtime_error("Failed to construct LogstashStats object: Got != 200 status code");
+            {
+                msg = "Failed to construct LogstashStats object: Got != 200 status code";
+                writeToLog(ERROR, logFile, msg);
+                throw std::runtime_error(msg);
+            }
             api_response = remove_headers((char **)&api_response);
         };
         ~LogstashStats(){free((char *)api_response);};
 
         std::string get_api_stats()
         {
-            std::string json_output;
-            json_output = json_output + hostname_ip() + api_stats() + cpu_load();
+            json j = {};
+            j += api_stats();
+            j += hostname_ip();
+            //for(auto& i: j.items())
+            //{}
 
-            return json_output;
+            return j.dump();
         };
 };
 
-std::unordered_map<std::string, float> LogstashStats::cpu_load()
+json LogstashStats::api_stats()
 {
-    std::unordered_map<std::string, float> stats;
-    const char *value = NULL;
-    union Key{const char *keys[5];};
-    Key keys;
+    json parsed_response = {};
 
-    keys = {"cpu\":", "load_average\":", "1m\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    float cpu_load_average_1m = strtof(value, NULL);
-    stats.insert({"logstash_stats_cpu_load_average_1m", cpu_load_average_1m});
+    try
+    {
+        json response = json::parse(api_response);
+        parsed_response += response["jvm"];
+    }
+    catch(json::parse_error& e)
+    {
+        writeToLog(ERROR, logFile, e.what());
+    }
 
-    keys = {"cpu\":", "load_average\":", "5m\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    float cpu_load_average_5m = strtof(value, NULL);
-    stats.insert({"logstash_stats_cpu_load_average_5m", cpu_load_average_5m});
-
-    keys = {"cpu\":", "load_average\":", "15m\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    float cpu_load_average_15m = strtof(value, NULL);
-    stats.insert({"logstash_stats_cpu_load_average_15m", cpu_load_average_15m});
-
-    return stats;
+    return parsed_response;
 }
 
-std::unordered_map<std::string, uint64_t> LogstashStats::api_stats()
-{
-    std::unordered_map<std::string, uint64_t> stats;
-    const char *value = NULL;
-    union Key{const char *keys[5];};
-    Key keys;
 
-    keys = {"jvm\":", "threads\":", "count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t jvm_threads_count = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_jvm_threads_count", jvm_threads_count});
 
-    keys = {"jvm\":", "threads\":", "peak_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t jvm_threads_peak_count = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_jvm_threads_peak_count", jvm_threads_peak_count});
 
-    keys = {"mem\":", "heap_used_percent\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t mem_heap_used_percent = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_mem_heap_used_percent", mem_heap_used_percent});
 
-    keys = {"mem\":", "heap_committed_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t mem_heap_committed_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_mem_heap_committed_in_bytes", mem_heap_committed_in_bytes});
-
-    keys = {"mem\":", "heap_max_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t mem_heap_max_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_mem_heap_max_in_bytes", mem_heap_max_in_bytes});
-
-    keys = {"mem\":", "heap_used_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t mem_heap_used_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_mem_heap_used_in_bytes", mem_heap_used_in_bytes});
-
-    keys = {"mem\":", "non_heap_used_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t mem_non_heap_used_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_mem_non_heap_used_in_bytes", mem_non_heap_used_in_bytes});
-
-    keys = {"mem\":", "non_heap_committed_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t mem_non_heap_committed_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_mem_non_heap_committed_in_bytes", mem_non_heap_committed_in_bytes});
-
-    keys = {"gc\":", "collectors\":", "old\":", "collection_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t gc_collectors_old_collection_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_gc_collectors_old_collection_time_in_millis", gc_collectors_old_collection_time_in_millis});
-
-    keys = {"gc\":", "collectors\":", "old\":", "collection_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t gc_collectors_old_collection_count = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_gc_collectors_old_collection_count", gc_collectors_old_collection_count});
-
-    keys = {"gc\":", "collectors\":", "young\":", "collection_time_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t gc_collectors_young_collection_time_in_millis = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_gc_collectors_young_collection_time_in_millis", gc_collectors_young_collection_time_in_millis});
-
-    keys = {"gc\":", "collectors\":", "young\":", "collection_count\":"};
-    if((value = extract_json_value(api_response, keys.keys, 4)) == NULL) return stats;
-    uint64_t gc_collectors_young_collection_count = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_gc_collectors_young_collection_count", gc_collectors_young_collection_count});
-
-    keys = {"process\":", "open_file_descriptors\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t process_open_file_descriptors = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_process_open_file_descriptors", process_open_file_descriptors});
-
-    keys = {"process\":", "peak_open_file_descriptors\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t process_peak_open_file_descriptors = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_process_peak_open_file_descriptors", process_peak_open_file_descriptors});
-
-    keys = {"process\":", "max_file_descriptors\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t process_max_file_descriptors = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_process_max_file_descriptors", process_max_file_descriptors});
-
-    keys = {"process\":", "mem\":", "total_virtual_in_bytes\":"};
-    if((value = extract_json_value(api_response, keys.keys, 3)) == NULL) return stats;
-    uint64_t process_mem_total_virtual_in_bytes = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_process_mem_total_virtual_in_bytes", process_mem_total_virtual_in_bytes});
-
-    keys = {"cpu\":", "total_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t cpu_total_in_millis = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_cpu_total_in_millis", cpu_total_in_millis});
-
-    keys = {"cpu\":", "percent\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t cpu_percent = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_cpu_percent", cpu_percent});
-
-    keys = {"events\":", "in\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t events_in = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_events_in", events_in});
-
-    keys = {"events\":", "filtered\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t events_filtered = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_events_filtered", events_filtered});
-
-    keys = {"events\":", "out\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t events_out = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_events_out", events_out});
-
-    keys = {"events\":", "duration_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t events_duration_in_millis = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_events_duration_in_millis", events_duration_in_millis});
-
-    keys = {"events\":", "queue_push_duration_in_millis\":"};
-    if((value = extract_json_value(api_response, keys.keys, 2)) == NULL) return stats;
-    uint64_t events_queue_push_duration_in_millis = strtol(value, NULL, 0);
-    stats.insert({"logstash_stats_events_queue_push_duration_in_millis", events_queue_push_duration_in_millis});
-
-    return stats;
-}
-
-/****** END OF LOGSTASH API CLASS ******/
-/***************************************/
-/***************************************/
-
-/***************************************/
-/***************************************/
-/************ OS FUNCTIONS *************/
 std::unordered_map<std::string, std::string> hostname_ip()
 {
     std::unordered_map<std::string, std::string> address;
@@ -1620,24 +1223,6 @@ std::unordered_map<std::string, std::string> is_address_in_use(const std::string
 /***************************************/
 /***************************************/
 
-int writeToLog(const char *filename, const char *message)
-{
-        FILE *logFile = fopen(filename, "a");
-        if(logFile == NULL){fprintf(stderr, "cannot open log file\n");return -1;}
-        struct tm *timeinfo;
-        time_t rawtime = time(NULL);
-
-        // stores time information
-        char time_buffer[20];
-
-        timeinfo = localtime(&rawtime);
-        strftime(time_buffer, sizeof(time_buffer), "%d-%m-%Y %H:%M:%S", timeinfo);
-        fprintf(logFile, "%s: %s\n", time_buffer, message);
-
-        fclose(logFile);
-        return 0;
-}
-
 void appendDateNow(std::string &arg, const char *dateFormat)
 {
 	struct tm *timeinfo;
@@ -1737,23 +1322,23 @@ std::vector<std::string>* checkCsv(const char *csvDir, const char *logFile)
             {
                 case -1:
                     msg = "Could not open file for reading: " + csvPath;
-                    writeToLog(logFile, msg.c_str());
+                    writeToLog(ERROR, logFile, msg.c_str());
                 break;
                 case 0:
                     if(isStrCsv(fileContent, ',') == -1)
                     {
                         msg = "The following file has failed csv validation: " + csvPath;
-                        writeToLog(logFile, msg.c_str());
+                        writeToLog(ERROR, logFile, msg.c_str());
                     }
                     else
                     {
                         msg = "The following file has passed csv validation: " + csvPath;
-                        writeToLog(logFile, msg.c_str());
+                        writeToLog(INFO, logFile, msg.c_str());
                     }
                 break;
                 case 1:
                     msg = "The following file is empty: " + csvPath;
-                    writeToLog(logFile, msg.c_str());
+                    writeToLog(ERROR, logFile, msg.c_str());
                 break;
             }
         }
@@ -1807,7 +1392,7 @@ void checkCsvByPattern(const char *csvDirPattern, const char *logFile)
 
 void printHelp()
 {
-	std::cout << "Usage for skimmer version 1.0.6" << std::endl;
+	std::cout << "Usage for skimmer version 1.1.0-dev" << std::endl;
     std::cout << "\t\t-h print this help message" << std::endl;
     std::cout << "\t\t-c path to configuration file" << std::endl;
     std::cout << "\t\t-s print sample configuration file" << std::endl;
@@ -1815,44 +1400,44 @@ void printHelp()
 
 void printSampleConfig()
 {
-    std::cout << "\t\t# index name in elasticsearch" << std::endl;
-    std::cout << "\t\tindex_name = skimmer" << std::endl;
-    std::cout << "\t\tindex_freq = monthly" << std::endl << std::endl;
+    std::cout << "# index name in elasticsearch" << std::endl;
+    std::cout << "index_name = skimmer" << std::endl;
+    std::cout << "index_freq = monthly" << std::endl << std::endl;
 
-    std::cout << "\t\t# type in elasticsearch index" << std::endl;
-    std::cout << "\t\tindex_type = _doc" << std::endl << std::endl;
+    std::cout << "# type in elasticsearch index" << std::endl;
+    std::cout << "index_type = _doc" << std::endl << std::endl;
 
-    std::cout << "\t\t# user and password to elasticsearch api" << std::endl;
-    std::cout << "\t\telasticsearch_auth = logserver:logserver" << std::endl << std::endl;
+    std::cout << "# user and password to elasticsearch api" << std::endl;
+    std::cout << "elasticsearch_auth = logserver:logserver" << std::endl << std::endl;
 
-    std::cout << "\t\t# available outputs" << std::endl;
-    std::cout << "\t\telasticsearch_address = 127.0.0.1:9200" << std::endl;
-    std::cout << "\t\t# logstash_address = 127.0.0.1:6110" << std::endl << std::endl;
+    std::cout << "# available outputs (logstash: use tcp input plugin with codec json)" << std::endl;
+    std::cout << "elasticsearch_address = 127.0.0.1:9200" << std::endl;
+    std::cout << "# logstash_address = 127.0.0.1:6110" << std::endl << std::endl;
 
-    std::cout << "\t\t# retrieve from api" << std::endl;
-    std::cout << "\t\telasticsearch_api = 127.0.0.1:9200" << std::endl;
-    std::cout << "\t\t# logstash_api = 127.0.0.1:9600" << std::endl << std::endl;
+    std::cout << "# retrieve from api" << std::endl;
+    std::cout << "elasticsearch_api = 127.0.0.1:9200" << std::endl;
+    std::cout << "# logstash_api = 127.0.0.1:9600" << std::endl << std::endl;
 
-    std::cout << "\t\t# path to log file" << std::endl;
-    std::cout << "\t\tlog_file = /tmp/skimmer.log" << std::endl << std::endl;
+    std::cout << "# path to log file" << std::endl;
+    std::cout << "log_file = /tmp/skimmer.log" << std::endl << std::endl;
 
-    std::cout << "\t\t# daemonize" << std::endl;
-    std::cout << "\t\tdaemonize = true" << std::endl << std::endl;
+    std::cout << "# daemonize" << std::endl;
+    std::cout << "daemonize = true" << std::endl << std::endl;
 
-    std::cout << "\t\t# comma separated OS statistics selected from the list [zombie,vm,fs,swap,net,cpu]" << std::endl;
-    std::cout << "\t\tos_stats = zombie,vm,fs,swap,net,cpu" << std::endl << std::endl;
+    std::cout << "# comma separated OS statistics selected from the list [zombie,vm,fs,swap,net,cpu]" << std::endl;
+    std::cout << "os_stats = zombie,vm,fs,swap,net,cpu" << std::endl << std::endl;
 
-    std::cout << "\t\t# comma separated process names to print their pid" << std::endl;
-    std::cout << "\t\tprocesses = /usr/sbin/sshd,/usr/sbin/rsyslogd" << std::endl << std::endl;
+    std::cout << "# comma separated process names to print their pid" << std::endl;
+    std::cout << "processes = /usr/sbin/sshd,/usr/sbin/rsyslogd" << std::endl << std::endl;
 
-    std::cout << "\t\t# comma separated systemd services to print their status" << std::endl;
-    std::cout << "\t\tsystemd_services = elasticsearch,logstash" << std::endl << std::endl;
+    std::cout << "# comma separated systemd services to print their status" << std::endl;
+    std::cout << "systemd_services = elasticsearch,logstash" << std::endl << std::endl;
 
-    std::cout << "\t\t# comma separated port numbers to print if address is in use" << std::endl;
-    std::cout << "\t\tport_numbers = 9200,9300,9600" << std::endl << std::endl;
+    std::cout << "# comma separated port numbers to print if address is in use" << std::endl;
+    std::cout << "port_numbers = 9200,9300,9600" << std::endl << std::endl;
 
-    std::cout << "\t\t# path to directory containing files needed to be csv validated" << std::endl;
-    std::cout << "\t\tcsv_path = /tmp/csv_dir" << std::endl;
+    std::cout << "# path to directory containing files needed to be csv validated" << std::endl;
+    std::cout << "# csv_path = /tmp/csv_dir" << std::endl;
 }
 
 struct Args
@@ -1870,7 +1455,7 @@ struct Args
     std::string logstashIPApi;
     size_t logstashPortApi;
     bool daemonize;
-	std::string indexFreq;
+    std::string indexFreq;
 
     std::vector<std::string> systemdS;
     std::vector<std::string> os;
@@ -1882,7 +1467,7 @@ struct Args
     Args():
         indexName("skimmer"),
         indexType("_doc"),
-        base64auth("bG9nc2VydmVyOmxvZ3NlcnZlcg=="), // logserver:logserver
+        //base64auth("bG9nc2VydmVyOmxvZ3NlcnZlcg=="),
         logFile("/tmp/skimmer.log"),
         daemonize(false)
     {};
@@ -2080,7 +1665,7 @@ int Args::readConfig(const char *filename)
         }
     }
 
-	std::string tmp = indexName;
+    std::string tmp = indexName;
     if(indexFreq == "daily")
         appendDateNow(tmp, "%Y.%m.%d");
     else if(indexFreq == "monthly")
@@ -2117,7 +1702,7 @@ int Args::readConfig(const char *filename)
                 "\n";
     }
 
-    writeToLog(logFile.c_str(), msg.c_str());
+    writeToLog(INFO, logFile.c_str(), msg.c_str());
     return 0;
 }
 
@@ -2181,7 +1766,7 @@ int main(int argc, char *argv[])
         pid_t pid = fork();
         if(pid == 0) 
         {
-			if(arg.indexFreq == "daily")
+            if(arg.indexFreq == "daily")
                 appendDateNow(arg.indexName, "%Y.%m.%d");
             else if(arg.indexFreq == "monthly")
                 appendDateNow(arg.indexName, "%Y.%m");
@@ -2246,7 +1831,7 @@ int main(int argc, char *argv[])
                 try
                 {
                     // node stats
-                    NodeStats node(arg.base64auth, arg.elasticsearchIPApi, arg.elasticsearchPortApi);
+                    NodeStats node(arg.logFile, arg.elasticsearchIPApi, arg.elasticsearchPortApi, arg.base64auth);
                     if(!arg.elasticsearchIP.empty())
                         sendDataToElasticsearch(node.get_api_stats(), arg.indexName, arg.indexType, arg.base64auth, arg.elasticsearchIP.c_str(), arg.elasticsearchPort);
 
@@ -2254,7 +1839,7 @@ int main(int argc, char *argv[])
                         sendData(node.get_api_stats().c_str(), arg.logstashIP.c_str(), arg.logstashPort);
 
                     // cluster stats
-                    ClusterStats cluster(arg.base64auth, arg.elasticsearchIPApi, arg.elasticsearchPortApi);
+                    ClusterStats cluster(arg.logFile, arg.elasticsearchIPApi, arg.elasticsearchPortApi, arg.base64auth);
                     if(!arg.elasticsearchIP.empty())
                         sendDataToElasticsearch(cluster.get_api_stats(), arg.indexName, arg.indexType, arg.base64auth, arg.elasticsearchIP.c_str(), arg.elasticsearchPort);
 
@@ -2272,7 +1857,7 @@ int main(int argc, char *argv[])
             {
                 try
                 {
-                    LogstashStats object(arg.logstashIPApi, arg.logstashPortApi);
+                    LogstashStats object(arg.logFile, arg.logstashIPApi, arg.logstashPortApi);
                     if(!arg.elasticsearchIP.empty())
                         sendDataToElasticsearch(object.get_api_stats(), arg.indexName, arg.indexType, arg.base64auth, arg.elasticsearchIP.c_str(), arg.elasticsearchPort);
 
