@@ -10,6 +10,8 @@
  * 1.0.4 - configuration options moved to file
  * 1.0.5 - added logstash api + bugfix in readResponse
  * 1.0.6 - added index_freq option
+ * 1.0.6a - changed _cat/master to accept text/plain response
+ * 1.0.6b - fixed zombie state
 */
 #define _XOPEN_SOURCE 700 // POSIX 2008
 #include <iostream>
@@ -443,7 +445,7 @@ std::unordered_map<std::string, std::string> Node::api_timestamp(const char *res
 
 int Node::master_node_ip()
 {
-    std::string elastic_request = "GET /_cat/master HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+    std::string elastic_request = "GET /_cat/master HTTP/1.0\r\nAccept: text/plain\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
     const char *response = readResponse(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
     if(response == NULL) return -1;
     if(getHttpStatus(response) != 200) return -1;
@@ -1807,7 +1809,7 @@ void checkCsvByPattern(const char *csvDirPattern, const char *logFile)
 
 void printHelp()
 {
-	std::cout << "Usage for skimmer version 1.0.6" << std::endl;
+	std::cout << "Usage for skimmer version 1.0.6b" << std::endl;
     std::cout << "\t\t-h print this help message" << std::endl;
     std::cout << "\t\t-c path to configuration file" << std::endl;
     std::cout << "\t\t-s print sample configuration file" << std::endl;
@@ -2168,6 +2170,11 @@ int Args::readArgs(int argc, char *argv[])
     return -1;
 }
 
+void reap_zombie(int signum)
+{
+    waitpid(-1, NULL, 0);
+}
+
 int main(int argc, char *argv[])
 {
     Args arg;
@@ -2289,9 +2296,16 @@ int main(int argc, char *argv[])
         }
         else
         {
-            if(arg.daemonize)
-          	  sleep(60);
-            waitpid(pid, NULL, 0);
+	    if(arg.daemonize)
+            {
+                struct sigaction s;
+                s.sa_handler = reap_zombie;
+                sigaction(SIGCHLD, &s, NULL);
+                unsigned int sec_to_sleep = 60;
+                while((sec_to_sleep = sleep(sec_to_sleep)) != 0);
+            }
+            else
+                waitpid(pid, NULL, 0);
         }
         } while(arg.daemonize);
     }
