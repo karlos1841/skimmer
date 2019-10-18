@@ -10,6 +10,8 @@
  * 1.0.4 - configuration options moved to file
  * 1.0.5 - added logstash api + bugfix in readResponse
  * 1.0.6 - added index_freq option
+ * 1.0.6a - changed _cat/master to accept text/plain response
+ * 1.0.6b - fixed zombie state
  * 1.1.0 - moved to nlohmann/json library
 */
 #define _XOPEN_SOURCE 700 // POSIX 2008
@@ -38,6 +40,7 @@
 #include <glob.h>
 #include <math.h>
 #include <openssl/ssl.h>
+#include <signal.h>
 
 #include "json.hpp"
 
@@ -504,9 +507,9 @@ int Node::master_node_ip()
 {
     std::string elastic_request;
     if(!base64auth.empty())
-        elastic_request = "GET /_cat/master HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+        elastic_request = "GET /_cat/master HTTP/1.0\r\nAccept: text/plain\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
     else
-        elastic_request = "GET /_cat/master HTTP/1.0\r\nContent-type: application/json\r\n\r\n";
+        elastic_request = "GET /_cat/master HTTP/1.0\r\nAccept: text/plain\r\n\r\n";
 
     const char *response = readResponse(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
     if(response == NULL) return -1;
@@ -1753,6 +1756,11 @@ int Args::readArgs(int argc, char *argv[])
     return -1;
 }
 
+void reap_zombie(int signum)
+{
+    waitpid(-1, NULL, 0);
+}
+
 int main(int argc, char *argv[])
 {
     Args arg;
@@ -1875,8 +1883,15 @@ int main(int argc, char *argv[])
         else
         {
             if(arg.daemonize)
-          	  sleep(60);
-            waitpid(pid, NULL, 0);
+            {
+                struct sigaction s;
+                s.sa_handler = reap_zombie;
+                sigaction(SIGCHLD, &s, NULL);
+                unsigned int sec_to_sleep = 60;
+                while((sec_to_sleep = sleep(sec_to_sleep)) != 0);
+            }
+            else
+                waitpid(pid, NULL, 0);
         }
         } while(arg.daemonize);
     }
