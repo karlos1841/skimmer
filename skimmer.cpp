@@ -14,6 +14,8 @@
  * 1.0.6b - fixed zombie state
  * 1.0.7  - added new metrics
  * 1.0.8  - added SSL support + rewritten json deserializer + other changes
+ * 1.0.9  - rewritten code responsible for config reading + more verbose log file + elasticsearch class overhaul
+ *          + by default reporting unknown systemd service status and unused ports
 */
 #define _XOPEN_SOURCE 700 // POSIX 2008
 #include <iostream>
@@ -46,6 +48,7 @@
 #define BUFFER      1024
 #define MIN_PORT    1
 #define MAX_PORT    65535
+#define VERSION     "1.0.9"
 
 /*** OS METRICS USING LINUX/POSIX LIBRARIES ***/
 // returns associative array with hostname and ip address of this machine
@@ -435,6 +438,24 @@ const char *extract_json_value(const char *response, const char **json_key)
     return value;
 }
 
+int writeToLog(const char *filename, const char *message)
+{
+        FILE *logFile = fopen(filename, "a");
+        if(logFile == NULL){fprintf(stderr, "cannot open log file\n");return -1;}
+        struct tm *timeinfo;
+        time_t rawtime = time(NULL);
+
+        // stores time information
+        char time_buffer[20];
+
+        timeinfo = localtime(&rawtime);
+        strftime(time_buffer, sizeof(time_buffer), "%d-%m-%Y %H:%M:%S", timeinfo);
+        fprintf(logFile, "%s: %s\n", time_buffer, message);
+
+        fclose(logFile);
+        return 0;
+}
+
 template<typename T>
 std::ostream &operator<<(std::ostream &stream, const std::unordered_map<std::string, T> &map)
 {
@@ -523,73 +544,109 @@ template std::string &operator+(std::string &sum, const std::unordered_map<std::
 
 /***************************************/
 /***************************************/
-/*********** NODE BASE CLASS ***********/
-// methods common for both node and cluster stats
-class Node
+/******* ELASTICSEARCH API CLASS *******/
+class ElasticsearchStats
 {
-    int master_node_ip();
-
-    protected:
+    std::pair<std::string, unsigned short> API;
     std::string masterNodeIP;
-    std::string nodeIP;
-    std::string nodeHostname;
+    std::string thisIP;
     std::string base64auth;
-    const char *elasticsearchIP;
-    unsigned short elasticsearchPort;
     std::unordered_map<std::string, std::string> api_timestamp(const char *);
     char *(*get_data)(const char *, const char *, unsigned short);
     int (*send_data)(const char *, const char *, unsigned short);
 
-    public:
-    Node(const std::string &_base64auth, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort): base64auth(_base64auth), elasticsearchIP(_elasticsearchIP.c_str()), elasticsearchPort(_elasticsearchPort)
-    {
-        int SSL = isSSL(elasticsearchIP, elasticsearchPort);
-        if(SSL == 0)
-        {
-            get_data = &readSSLResponse;
-            send_data = &sendSSLData;
-        }
-        else if(SSL == 1)
-        {
-            get_data = &readResponse;
-            send_data = &sendData;
-        }
-        else
-            throw std::runtime_error("Failed to construct Node object: Unable to communicate with cluster");
+    // populate masterNodeIP with IP of a master node
+    int master_node_ip();
 
-        if(node_hostname_ip(nodeHostname, nodeIP) == -1)
-            throw std::runtime_error("Failed to construct Node object: Hostname/IP unknown");
-        if(master_node_ip() == -1)
-            throw std::runtime_error("Failed to construct Node object: Unable to determine master node");
+    // stats
+    const char *node_response;
+    const char *cluster_response;
+    const char *cluster_health_response;
+    const char *cluster_pending_tasks_response;
+
+    std::unordered_map<std::string, uint64_t> node_stats();
+    std::unordered_map<std::string, uint64_t> cluster_stats();
+    std::unordered_map<std::string, float> cluster_health();
+    std::unordered_map<std::string, uint64_t> cluster_pending_tasks();
+
+    public:
+    ElasticsearchStats(const std::pair<std::string, unsigned short> &_API, const std::string &_base64auth):
+    API(_API), base64auth(_base64auth)
+    {
+        // Init
+        node_response = NULL;
+        cluster_response = NULL;
+        cluster_health_response = NULL;
+        cluster_pending_tasks_response = NULL;
+
+        // API
+        if(!API.first.empty()) {
+
+            // determine whether to use SSL or plain
+            int SSL = isSSL(API.first.c_str(), API.second);
+            if(SSL == 0) { get_data = &readSSLResponse; send_data = &sendSSLData; }
+            else if(SSL == 1) { get_data = &readResponse; send_data = &sendData; }
+            else throw std::runtime_error("Failed to construct ElasticsearchStats object: Unable to communicate with cluster");
+
+            // determine this IP
+            if(node_hostname_ip(thisIP, thisIP) == -1) throw std::runtime_error("Failed to construct ElasticsearchStats object: Hostname/IP unknown");
+            // determine master node IP
+            if(master_node_ip() == -1) throw std::runtime_error("Failed to construct ElasticsearchStats object: Unable to determine master node");
+
+            // retrieve nodes stats
+            std::string elastic_request = "GET /_nodes/" + thisIP + "/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+            node_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
+
+            // retrieve cluster stats
+            if(thisIP == masterNodeIP) {
+                elastic_request = "GET /_cluster/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+                cluster_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
+                elastic_request = "GET /_cluster/health HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+	            cluster_health_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
+                elastic_request = "GET /_cluster/pending_tasks HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+                cluster_pending_tasks_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
+            }
+        }
+    };
+    ~ElasticsearchStats(){free((char *)node_response); free((char *)cluster_response); free((char *)cluster_health_response); free((char *)cluster_pending_tasks_response);};
+
+    std::string get_node_stats()
+    {
+        if(node_response == NULL) return "";
+
+        std::string json_output;
+        json_output = json_output + api_timestamp(node_response) + hostname_ip() + node_stats();
+
+        return json_output;
     };
 
-    int sendDataToElasticsearch(const std::string &data, const std::string &index, const std::string &type);
+    std::string get_cluster_stats()
+    {
+        if(cluster_response == NULL || cluster_health_response == NULL || cluster_pending_tasks_response == NULL) return "";
+
+        std::string json_output;
+        json_output = json_output + api_timestamp(cluster_response) + hostname_ip() + cluster_stats() + cluster_health() + cluster_pending_tasks();
+
+        return json_output;
+    };
 };
 
-int Node::sendDataToElasticsearch(const std::string &data, const std::string &index, const std::string &type)
+int ElasticsearchStats::master_node_ip()
 {
-    // ISO8601 UTC timestamp
-	struct tm *timeinfo;
-	time_t rawtime = time(NULL);
-	char timestamp[30];
-	timeinfo = gmtime(&rawtime);
-	strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
-    std::string data_str = data;
-    data_str.pop_back();
-    std::string elastic_data = data_str + ",\"@timestamp\": " + "\"" + timestamp + "\"}\n";
+    std::string elastic_request = "GET /_cat/master?h=ip HTTP/1.0\r\nAccept: text/plain\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+    const char *response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
+    if(response == NULL) return -1;
+    if(getHttpStatus(response) != 200) { free((char *)response); return -1; }
+    response = remove_headers((char **)&response);
 
-    std::string elastic_request = "POST /" + index + "/" + type + " HTTP/1.0\r\n" +
-	"Content-type: application/json\r\n" +
-    "Authorization: Basic " + base64auth + "\r\n" +
-	"Content-length: " + std::to_string(elastic_data.size()) + "\r\n\r\n" +
-	elastic_data;
+    std::istringstream istream(response);
+    istream >> masterNodeIP;
 
-    std::cout << elastic_request << std::endl;
-
-    return send_data(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
+    free((char *)response);
+    return 0;
 }
 
-std::unordered_map<std::string, std::string> Node::api_timestamp(const char *response)
+std::unordered_map<std::string, std::string> ElasticsearchStats::api_timestamp(const char *response)
 {
     std::unordered_map<std::string, std::string> timestamp;
     const char *timestamp_ptr = NULL;
@@ -610,264 +667,11 @@ std::unordered_map<std::string, std::string> Node::api_timestamp(const char *res
     return timestamp;
 }
 
-int Node::master_node_ip()
-{
-    std::string elastic_request = "GET /_cat/master HTTP/1.0\r\nAccept: text/plain\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-    const char *response = get_data(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
-    if(response == NULL) return -1;
-    if(getHttpStatus(response) != 200) return -1;
-    response = remove_headers((char **)&response);
-
-    std::istringstream istream(response);
-    std::string tmp;
-    istream >> tmp >> tmp >> masterNodeIP;
-
-    free((char *)response);
-    return 0;
-}
-/******* END OF NODE BASE CLASS *******/
-/**************************************/
-/**************************************/
-
-
-/**************************************/
-/**************************************/
-/********* CLUSTER API CLASS **********/
-class ClusterStats : public Node
-{
-    const char *api_response;
-    const char *api_health_response;
-    const char *pending_tasks_response;
-
-    std::unordered_map<std::string, uint64_t> api_stats();
-    std::unordered_map<std::string, float> api_health();
-    std::unordered_map<std::string, uint64_t> pending_tasks(); 
-    
-
-    public:
-    ClusterStats(const std::string &_base64auth, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort): Node(_base64auth, _elasticsearchIP, _elasticsearchPort)
-    {
-        if(nodeIP != masterNodeIP)
-            throw std::runtime_error("Failed to construct ClusterStats object: It is not a master node");
-
-        std::string elastic_request = "GET /_cluster/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-        api_response = get_data(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
-        elastic_request = "GET /_cluster/health HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-	    api_health_response = get_data(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
-        elastic_request = "GET /_cluster/pending_tasks HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-        pending_tasks_response = get_data(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
-        if(api_response == NULL || api_health_response == NULL || pending_tasks_response == NULL)
-            throw std::runtime_error("Failed to construct ClusterStats object: NULL response");
-    };
-    ~ClusterStats(){free((char *)api_response); free((char *)api_health_response); free((char *)pending_tasks_response);};
-
-    std::string get_api_stats()
-    {
-        std::string json_output;
-        json_output = json_output + api_timestamp(api_response) + hostname_ip() + api_stats() + api_health() + pending_tasks();
-
-        return json_output;
-    };
-};
-
-std::unordered_map<std::string, float> ClusterStats::api_health()
-{
-    std::unordered_map<std::string, float> stats;
-    if(getHttpStatus(api_health_response) != 200) return stats;
-    api_health_response = remove_headers((char **)&api_health_response);
-    const char *value = NULL;
-
-    const int col = 7;
-    const int row = 2;
-    const char *keys[col][row] = 
-    {
-        {"active_shards_percent_as_number", NULL},
-        {"status", NULL},
-        {"number_of_nodes", NULL},
-        {"initializing_shards", NULL},
-        {"unassigned_shards", NULL},
-        {"active_primary_shards", NULL},
-        {"active_shards", NULL}
-    };
-
-    for(int i = 0; i < col; i++)
-    {
-        if((value = extract_json_value(api_health_response, keys[i])) != NULL)
-        {
-            if(i == 0)
-                stats.insert({"cluster_stats_availability", strtof(value, NULL)});
-            else if(i == 1)
-            {
-                std::string cluster_health_status(value);
-                float status = -1;
-                if(cluster_health_status.find("green") != std::string::npos)
-                    status = 2;
-                else if(cluster_health_status.find("yellow") != std::string::npos)
-                    status = 1;
-                else if(cluster_health_status.find("red") != std::string::npos)
-                    status = 0;
-
-                stats.insert({"cluster_health_status", status});
-            }
-            else
-                stats.insert({"cluster_health_" + std::string(keys[i][0]), strtof(value, NULL)});
-        }
-    }
-
-    return stats;
-}
-
-std::unordered_map<std::string, uint64_t> ClusterStats::api_stats()
+std::unordered_map<std::string, uint64_t> ElasticsearchStats::node_stats()
 {
     std::unordered_map<std::string, uint64_t> stats;
-    if(getHttpStatus(api_response) != 200) return stats;
-    api_response = remove_headers((char **)&api_response);
-    const char *value = NULL;
-
-    const int col = 43;
-    const int row = 10;
-    const char *keys[col][row] =
-    {
-        {"nodes", "count", "total", NULL},
-        {"nodes", "os", "mem", "total_in_bytes", NULL},
-        {"nodes", "jvm", "mem", "heap_used_in_bytes", NULL},
-        {"nodes", "jvm", "mem", "heap_max_in_bytes", NULL},
-        {"indices", "count", NULL},
-        {"indices", "shards", "total", NULL},
-        {"indices", "shards", "index", "shards", "min", NULL},
-        {"indices", "shards", "index", "shards", "max", NULL},
-        {"indices", "shards", "index", "primaries", "min", NULL},
-        {"indices", "shards", "index", "primaries", "max", NULL},
-        {"indices", "shards", "index", "replication", "min", NULL},
-        {"indices", "shards", "index", "replication", "max", NULL},
-        {"indices", "docs", "count", NULL},
-        {"indices", "docs", "deleted", NULL},
-        {"indices", "store", "size_in_bytes", NULL},
-        {"indices", "store", "throttle_time_in_millis", NULL},
-        {"indices", "fielddata", "memory_size_in_bytes", NULL},
-        {"indices", "fielddata", "evictions", NULL},
-        {"indices", "query_cache", "memory_size_in_bytes", NULL},
-        {"indices", "query_cache", "total_count", NULL},
-        {"indices", "query_cache", "hit_count", NULL},
-        {"indices", "query_cache", "miss_count", NULL},
-        {"indices", "query_cache", "cache_size", NULL},
-        {"indices", "query_cache", "cache_count", NULL},
-        {"indices", "query_cache", "evictions", NULL},
-        {"indices", "segments", "count", NULL},
-        {"indices", "segments", "memory_in_bytes", NULL},
-        {"indices", "segments", "terms_memory_in_bytes", NULL},
-        {"indices", "segments", "stored_fields_memory_in_bytes", NULL},
-        {"indices", "segments", "term_vectors_memory_in_bytes", NULL},
-        {"indices", "segments", "norms_memory_in_bytes", NULL},
-        {"indices", "segments", "doc_values_memory_in_bytes", NULL},
-        {"indices", "segments", "index_writer_memory_in_bytes", NULL},
-        {"indices", "segments", "index_writer_max_memory_in_bytes", NULL},
-        {"indices", "segments", "version_map_memory_in_bytes", NULL},
-        {"indices", "segments", "fixed_bit_set_memory_in_bytes", NULL},
-        {"nodes", "os", "available_processors", NULL},
-        {"nodes", "os", "allocated_processors", NULL},
-        {"nodes", "process", "cpu", "percent", NULL},
-        {"nodes", "process", "open_file_descriptors", "min", NULL},
-        {"nodes", "process", "open_file_descriptors", "max", NULL},
-        {"nodes", "fs", "total_in_bytes", NULL},
-        {"nodes", "fs", "free_in_bytes", NULL}
-    };
-
-    for(int i = 0; i < col; i++)
-    {
-        if((value = extract_json_value(api_response, keys[i])) != NULL)
-        {
-            std::string description = "cluster_stats";
-            for(int j = 0; keys[i][j] != NULL; j++)
-            {
-                description += "_";
-                description += keys[i][j];
-            }
-
-            stats.insert({description, strtol(value, NULL, 0)});
-        }
-    }
-
-    return stats;
-}
-
-std::unordered_map<std::string, uint64_t> ClusterStats::pending_tasks()
-{
-    std::unordered_map<std::string, uint64_t> stats;
-    
-    if(getHttpStatus(pending_tasks_response) != 200) return stats;
-    pending_tasks_response = remove_headers((char **)&pending_tasks_response);
-    std::string json_response(this->pending_tasks_response);
-    
-    std::size_t found = -1;
-    uint64_t pending_tasks_total = -1;
-    while((found = json_response.find('{', found + 1)) != std::string::npos) 
-    {
-        ++pending_tasks_total;
-    }
-
-    stats.insert({"pending_tasks_total", pending_tasks_total});
-
-    found = -1;
-    uint64_t pending_tasks_urgent = 0;
-    while((found = json_response.find("URGENT", found + 1)) != std::string::npos) 
-    {
-        ++pending_tasks_urgent;
-    }
-
-    stats.insert({"pending_tasks_urgent", pending_tasks_urgent});
-
-    found = -1;
-    uint64_t pending_tasks_high = 0;
-    while((found = json_response.find("HIGH", found + 1)) != std::string::npos) 
-    {
-        ++pending_tasks_high;
-    }
-
-    stats.insert({"pending_tasks_high", pending_tasks_high});
-
-    return stats;
-}
-
-/****** END OF CLUSTER API CLASS ******/
-/**************************************/
-/**************************************/
-
-
-/**************************************/
-/**************************************/
-/*********** NODE API CLASS ***********/
-class NodeStats : public Node
-{
-    // API
-    const char *api_response;
-
-    std::unordered_map<std::string, uint64_t> api_stats();
-
-    public:
-        NodeStats(const std::string &_base64auth, const std::string &_elasticsearchIP, unsigned short _elasticsearchPort): Node(_base64auth, _elasticsearchIP, _elasticsearchPort)
-        {
-            const std::string elastic_request = "GET /_nodes/" + nodeIP + "/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-            api_response = get_data(elastic_request.c_str(), elasticsearchIP, elasticsearchPort);
-            if(api_response == NULL)
-                throw std::runtime_error("Failed to construct NodeStats object: NULL response");
-        };
-        ~NodeStats(){free((char *)api_response);};
-
-        std::string get_api_stats()
-        {
-            std::string json_output;
-            json_output = json_output + api_timestamp(api_response) + hostname_ip() + api_stats();
-
-            return json_output;
-        };
-};
-
-std::unordered_map<std::string, uint64_t> NodeStats::api_stats()
-{
-    std::unordered_map<std::string, uint64_t> stats;
-    if(getHttpStatus(api_response) != 200) return stats;
-    api_response = remove_headers((char **)&api_response);
+    if(getHttpStatus(node_response) != 200) return stats;
+    node_response = remove_headers((char **)&node_response);
     const char *value = NULL;
 
     const int col = 63;
@@ -941,7 +745,7 @@ std::unordered_map<std::string, uint64_t> NodeStats::api_stats()
 
     for(int i = 0; i < col; i++)
     {
-        if((value = extract_json_value(api_response, keys[i])) != NULL)
+        if((value = extract_json_value(node_response, keys[i])) != NULL)
         {
             std::string description = "node_stats";
             for(int j = 0; keys[i][j] != NULL; j++)
@@ -965,46 +769,260 @@ std::unordered_map<std::string, uint64_t> NodeStats::api_stats()
 
     return stats;
 }
-/******** END OF NODE API CLASS ********/
-/***************************************/
-/***************************************/
+
+std::unordered_map<std::string, float> ElasticsearchStats::cluster_health()
+{
+    std::unordered_map<std::string, float> stats;
+    if(getHttpStatus(cluster_health_response) != 200) return stats;
+    cluster_health_response = remove_headers((char **)&cluster_health_response);
+    const char *value = NULL;
+
+    const int col = 7;
+    const int row = 2;
+    const char *keys[col][row] = 
+    {
+        {"active_shards_percent_as_number", NULL},
+        {"status", NULL},
+        {"number_of_nodes", NULL},
+        {"initializing_shards", NULL},
+        {"unassigned_shards", NULL},
+        {"active_primary_shards", NULL},
+        {"active_shards", NULL}
+    };
+
+    for(int i = 0; i < col; i++)
+    {
+        if((value = extract_json_value(cluster_health_response, keys[i])) != NULL)
+        {
+            if(i == 0)
+                stats.insert({"cluster_stats_availability", strtof(value, NULL)});
+            else if(i == 1)
+            {
+                std::string cluster_health_status(value);
+                float status = -1;
+                if(cluster_health_status.find("green") != std::string::npos)
+                    status = 2;
+                else if(cluster_health_status.find("yellow") != std::string::npos)
+                    status = 1;
+                else if(cluster_health_status.find("red") != std::string::npos)
+                    status = 0;
+
+                stats.insert({"cluster_health_status", status});
+            }
+            else
+                stats.insert({"cluster_health_" + std::string(keys[i][0]), strtof(value, NULL)});
+        }
+    }
+
+    return stats;
+}
+
+std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_stats()
+{
+    std::unordered_map<std::string, uint64_t> stats;
+    if(getHttpStatus(cluster_response) != 200) return stats;
+    cluster_response = remove_headers((char **)&cluster_response);
+    const char *value = NULL;
+
+    const int col = 43;
+    const int row = 10;
+    const char *keys[col][row] =
+    {
+        {"nodes", "count", "total", NULL},
+        {"nodes", "os", "mem", "total_in_bytes", NULL},
+        {"nodes", "jvm", "mem", "heap_used_in_bytes", NULL},
+        {"nodes", "jvm", "mem", "heap_max_in_bytes", NULL},
+        {"indices", "count", NULL},
+        {"indices", "shards", "total", NULL},
+        {"indices", "shards", "index", "shards", "min", NULL},
+        {"indices", "shards", "index", "shards", "max", NULL},
+        {"indices", "shards", "index", "primaries", "min", NULL},
+        {"indices", "shards", "index", "primaries", "max", NULL},
+        {"indices", "shards", "index", "replication", "min", NULL},
+        {"indices", "shards", "index", "replication", "max", NULL},
+        {"indices", "docs", "count", NULL},
+        {"indices", "docs", "deleted", NULL},
+        {"indices", "store", "size_in_bytes", NULL},
+        {"indices", "store", "throttle_time_in_millis", NULL},
+        {"indices", "fielddata", "memory_size_in_bytes", NULL},
+        {"indices", "fielddata", "evictions", NULL},
+        {"indices", "query_cache", "memory_size_in_bytes", NULL},
+        {"indices", "query_cache", "total_count", NULL},
+        {"indices", "query_cache", "hit_count", NULL},
+        {"indices", "query_cache", "miss_count", NULL},
+        {"indices", "query_cache", "cache_size", NULL},
+        {"indices", "query_cache", "cache_count", NULL},
+        {"indices", "query_cache", "evictions", NULL},
+        {"indices", "segments", "count", NULL},
+        {"indices", "segments", "memory_in_bytes", NULL},
+        {"indices", "segments", "terms_memory_in_bytes", NULL},
+        {"indices", "segments", "stored_fields_memory_in_bytes", NULL},
+        {"indices", "segments", "term_vectors_memory_in_bytes", NULL},
+        {"indices", "segments", "norms_memory_in_bytes", NULL},
+        {"indices", "segments", "doc_values_memory_in_bytes", NULL},
+        {"indices", "segments", "index_writer_memory_in_bytes", NULL},
+        {"indices", "segments", "index_writer_max_memory_in_bytes", NULL},
+        {"indices", "segments", "version_map_memory_in_bytes", NULL},
+        {"indices", "segments", "fixed_bit_set_memory_in_bytes", NULL},
+        {"nodes", "os", "available_processors", NULL},
+        {"nodes", "os", "allocated_processors", NULL},
+        {"nodes", "process", "cpu", "percent", NULL},
+        {"nodes", "process", "open_file_descriptors", "min", NULL},
+        {"nodes", "process", "open_file_descriptors", "max", NULL},
+        {"nodes", "fs", "total_in_bytes", NULL},
+        {"nodes", "fs", "free_in_bytes", NULL}
+    };
+
+    for(int i = 0; i < col; i++)
+    {
+        if((value = extract_json_value(cluster_response, keys[i])) != NULL)
+        {
+            std::string description = "cluster_stats";
+            for(int j = 0; keys[i][j] != NULL; j++)
+            {
+                description += "_";
+                description += keys[i][j];
+            }
+
+            stats.insert({description, strtol(value, NULL, 0)});
+        }
+    }
+
+    return stats;
+}
+
+std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_pending_tasks()
+{
+    std::unordered_map<std::string, uint64_t> stats;
+    
+    if(getHttpStatus(cluster_pending_tasks_response) != 200) return stats;
+    cluster_pending_tasks_response = remove_headers((char **)&cluster_pending_tasks_response);
+    std::string json_response(this->cluster_pending_tasks_response);
+    
+    std::size_t found = -1;
+    uint64_t pending_tasks_total = -1;
+    while((found = json_response.find('{', found + 1)) != std::string::npos) 
+    {
+        ++pending_tasks_total;
+    }
+
+    stats.insert({"pending_tasks_total", pending_tasks_total});
+
+    found = -1;
+    uint64_t pending_tasks_urgent = 0;
+    while((found = json_response.find("URGENT", found + 1)) != std::string::npos) 
+    {
+        ++pending_tasks_urgent;
+    }
+
+    stats.insert({"pending_tasks_urgent", pending_tasks_urgent});
+
+    found = -1;
+    uint64_t pending_tasks_high = 0;
+    while((found = json_response.find("HIGH", found + 1)) != std::string::npos) 
+    {
+        ++pending_tasks_high;
+    }
+
+    stats.insert({"pending_tasks_high", pending_tasks_high});
+
+    return stats;
+}
+
+int sendDataToElasticsearch(const std::pair<std::string, unsigned short> &OUTPUT, const std::string &index, const std::string &type, const std::string &base64auth, const std::string &data, const char *logfile)
+{
+    if(data.empty()) return -1;
+    if(OUTPUT.first.empty()) return -1;
+    // ISO8601 UTC timestamp
+	struct tm *timeinfo;
+	time_t rawtime = time(NULL);
+	char timestamp[30];
+	timeinfo = gmtime(&rawtime);
+	strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+    std::string data_str = data;
+    data_str.pop_back();
+    std::string elastic_data = data_str + ",\"@timestamp\": " + "\"" + timestamp + "\"}\n";
+
+    std::string elastic_request = "POST /" + index + "/" + type + " HTTP/1.0\r\n" +
+	"Content-type: application/json\r\n" +
+    "Authorization: Basic " + base64auth + "\r\n" +
+	"Content-length: " + std::to_string(elastic_data.size()) + "\r\n\r\n" +
+	elastic_data;
+
+    std::string msg = "Sent the following request to " + OUTPUT.first + " on port " + std::to_string(OUTPUT.second) + ":\n";
+    msg += elastic_request;
+    writeToLog(logfile, msg.c_str());
+
+    char *response = NULL;
+    if(isSSL(OUTPUT.first.c_str(), OUTPUT.second))
+        response = readResponse(elastic_request.c_str(), OUTPUT.first.c_str(), OUTPUT.second);
+    else
+        response = readSSLResponse(elastic_request.c_str(), OUTPUT.first.c_str(), OUTPUT.second);
+
+    if(response == NULL) { writeToLog(logfile, "Got NULL response\n"); ; return -1; }
+
+    msg = "Got the following response back:\n" + std::string(response);
+    writeToLog(logfile, msg.c_str());
+    free(response);
+    return 0;
+}
+/*** END OF ELASTICSEARCH API CLASS ***/
+/**************************************/
+/**************************************/
+
 
 /**************************************/
 /**************************************/
 /********* LOGSTASH API CLASS *********/
-
 class LogstashStats
 {
     // API
     const char *api_response;
-    const char *logstashIP;
-    unsigned short logstashPort;
+    std::pair<std::string, unsigned short> API;
 
     std::unordered_map<std::string, uint64_t> api_stats();
     std::unordered_map<std::string, float> cpu_load();
 
     public:
-        LogstashStats(const std::string &_logstashIP, unsigned short _logstashPort): logstashIP(_logstashIP.c_str()), logstashPort(_logstashPort)
+        LogstashStats(const std::pair<std::string, unsigned short> &_API): API(_API)
         {
-            const std::string logstash_request = "GET /_node/stats/?human=false HTTP/1.0\r\nContent-type: application/json\r\n\r\n";
-            api_response = readResponse(logstash_request.c_str(), logstashIP, logstashPort);
-            if(api_response == NULL)
-                throw std::runtime_error("Failed to construct LogstashStats object: NULL response");
-            if(getHttpStatus(api_response) != 200)
-                throw std::runtime_error("Failed to construct LogstashStats object: Got != 200 status code");
-            else if(api_response != NULL)
-                api_response = remove_headers((char **)&api_response);
+            // Init
+            api_response = NULL;
+
+            // API
+            if(!API.first.empty()) {
+
+                const std::string logstash_request = "GET /_node/stats/?human=false HTTP/1.0\r\nContent-type: application/json\r\n\r\n";
+                api_response = readResponse(logstash_request.c_str(), API.first.c_str(), API.second);
+                if(api_response == NULL) throw std::runtime_error("Failed to construct LogstashStats object: NULL response");
+
+                if(getHttpStatus(api_response) != 200)
+                {
+                    free((char *)api_response); api_response = NULL;
+                    throw std::runtime_error("Failed to construct LogstashStats object: Got != 200 status code");
+                }
+                else api_response = remove_headers((char **)&api_response);
+            }
         };
         ~LogstashStats(){free((char *)api_response);};
 
         std::string get_api_stats()
         {
+            if(api_response == NULL) return "";
+
             std::string json_output;
             json_output = json_output + hostname_ip() + api_stats() + cpu_load();
 
             return json_output;
         };
 };
+
+int sendDataToLogstash(const std::pair<std::string, unsigned short> &OUTPUT, const std::string &data)
+{
+    if(data.empty()) return -1;
+    if(OUTPUT.first.empty()) return -1;
+    return sendData(data.c_str(), OUTPUT.first.c_str(), OUTPUT.second);
+}
 
 std::unordered_map<std::string, float> LogstashStats::cpu_load()
 {
@@ -1386,23 +1404,21 @@ std::unordered_map<std::string, std::string> is_address_in_use(const std::string
 	memset(&server_info, 0, sizeof(server_info));
 	server_info.sin_family = AF_INET;
 	server_info.sin_port = htons(port);
-	if((server_info.sin_addr.s_addr = hostnameToIP(ip.c_str())) == 0)
+	if((server_info.sin_addr.s_addr = hostnameToIP(ip.c_str())) != 0)
 	{
-		//const char *msg = "[Error] incorrect address was given";
-		return port_status;
-	}
-	errno = 0;
-	bind(socket_descriptor, (struct sockaddr *)&server_info, sizeof(server_info));
-	switch(errno)
-	{
-		case 0:
-			if(!skip_unused)
-				port_status.insert({"node_stats_tcp_port_" + std::to_string(port), "unused"});
-		break;
-		case EADDRINUSE:
-			port_status.insert({"node_stats_tcp_port_" + std::to_string(port), "in_use"});
-		break;
-	}
+	    errno = 0;
+	    bind(socket_descriptor, (struct sockaddr *)&server_info, sizeof(server_info));
+	    switch(errno)
+	    {
+		    case 0:
+			    if(!skip_unused)
+				    port_status.insert({"node_stats_tcp_port_" + std::to_string(port), "unused"});
+		    break;
+		    case EADDRINUSE:
+			    port_status.insert({"node_stats_tcp_port_" + std::to_string(port), "in_use"});
+		    break;
+	    }
+    }
 
 	close(socket_descriptor);
 	return port_status;
@@ -1410,24 +1426,6 @@ std::unordered_map<std::string, std::string> is_address_in_use(const std::string
 /********* END OF OS FUNCTIONS *********/
 /***************************************/
 /***************************************/
-
-int writeToLog(const char *filename, const char *message)
-{
-        FILE *logFile = fopen(filename, "a");
-        if(logFile == NULL){fprintf(stderr, "cannot open log file\n");return -1;}
-        struct tm *timeinfo;
-        time_t rawtime = time(NULL);
-
-        // stores time information
-        char time_buffer[20];
-
-        timeinfo = localtime(&rawtime);
-        strftime(time_buffer, sizeof(time_buffer), "%d-%m-%Y %H:%M:%S", timeinfo);
-        fprintf(logFile, "%s: %s\n", time_buffer, message);
-
-        fclose(logFile);
-        return 0;
-}
 
 void appendDateNow(std::string &arg, const char *dateFormat)
 {
@@ -1596,9 +1594,153 @@ void checkCsvByPattern(const char *csvDirPattern, const char *logFile)
     // TODO: delete vector on SIGTERM in main
 }
 
+void base64Encode(const char* message, std::string &base64auth)
+{
+	BIO *bio, *b64;
+	FILE* stream;
+    char *buffer;
+	int encodedSize = 4*ceil((double)strlen(message)/3);
+	buffer = (char *)malloc(encodedSize+1);
+
+	stream = fmemopen(buffer, encodedSize+1, "w");
+	b64 = BIO_new(BIO_f_base64());
+	bio = BIO_new_fp(stream, BIO_NOCLOSE);
+	bio = BIO_push(b64, bio);
+	BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL); //Ignore newlines - write everything in one line
+	BIO_write(bio, message, strlen(message));
+	BIO_flush(bio);
+	BIO_free_all(bio);
+	fclose(stream);
+    base64auth = buffer;
+    free(buffer);
+}
+
+void reap_zombie(int signum)
+{
+    waitpid(-1, NULL, 0);
+}
+
+class ConfigFile
+{
+    std::unordered_map<std::string, std::string> config;
+    void trim(std::string &str) {
+        std::size_t first = str.find_first_not_of(" \t\f\v\n\r");
+        if(first == std::string::npos) return;
+        std::size_t last = str.find_last_not_of(" \t\f\v\n\r");
+        str = str.substr(first, (last - first + 1));
+    }
+
+    public:
+        ConfigFile(const std::string &filename, std::string &err) {
+            std::ifstream ifs(filename);
+            std::string line;
+
+            if(!ifs.good()) { err = "Could not open config file"; return; }
+            while(std::getline(ifs, line))
+            {
+                std::size_t found = line.find('=');
+                if(found == std::string::npos) continue;
+
+                std::string key = line.substr(0, found);
+                trim(key);
+                if(key[0] == '#') continue;
+
+                std::string value = line.substr(found, std::string::npos);
+                value.erase(0, 1); // erase '='
+                trim(value);
+
+                config.insert({key, value});
+            }
+
+            ifs.close();
+        }
+
+        void get_value(const std::string &key, std::string &value) {
+            for(auto &pair: config)
+            {
+                if(pair.first == key) {
+                    value = pair.second;
+                    break;
+                }
+            }
+        }
+
+        void get_value(const std::string &key, bool &value) {
+            std::string v;
+            for(auto &pair: config)
+            {
+                if(pair.first == key) {
+                    v = pair.second;
+                    break;
+                }
+            }
+
+            if(v == "true") value = true;
+            else value = false;
+        }
+
+        void get_value(const std::string &key, std::vector<std::string> &value) {
+            std::string v;
+            for(auto &pair: config)
+            {
+                if(pair.first == key) {
+                    v = pair.second;
+                    break;
+                }
+            }
+
+            if(v.empty()) return;
+
+            std::istringstream iarg(v);
+            std::string token;
+            while(std::getline(iarg, token, ',')) {
+                value.push_back(token);
+            }
+        }
+
+        void get_value(const std::string &key, std::vector<int> &value) {
+            std::string v;
+            for(auto &pair: config)
+            {
+                if(pair.first == key) {
+                    v = pair.second;
+                    break;
+                }
+            }
+
+            if(v.empty()) return;
+
+            std::istringstream iarg(v);
+            std::string token;
+            while(std::getline(iarg, token, ',')) {
+                value.push_back(std::stoi(token));
+            }
+        }
+
+        void get_value(const std::string &key, std::pair<std::string, int> &value) {
+            std::string v;
+            for(auto &pair: config)
+            {
+                if(pair.first == key) {
+                    v = pair.second;
+                    break;
+                }
+            }
+
+            if(v.empty()) return;
+
+            std::istringstream iarg(v);
+            std::string token;
+            std::getline(iarg, token, ':');
+            value.first = token;
+            std::getline(iarg, token);
+            value.second = std::stoi(token);
+        }
+};
+
 void printHelp()
 {
-	std::cout << "Usage for skimmer version 1.0.8" << std::endl;
+	std::cout << "Usage for skimmer version " << VERSION << std::endl;
     std::cout << "\t\t-h print this help message" << std::endl;
     std::cout << "\t\t-c path to configuration file" << std::endl;
     std::cout << "\t\t-s print sample configuration file" << std::endl;
@@ -1621,6 +1763,7 @@ void printSampleConfig()
     std::cout << "\t\t# logstash_address = 127.0.0.1:6110" << std::endl << std::endl;
 
     std::cout << "\t\t# retrieve from api" << std::endl;
+    std::cout << "\t\telasticsearch_api = 127.0.0.1:9200" << std::endl;
     std::cout << "\t\t# logstash_api = 127.0.0.1:9600" << std::endl << std::endl;
 
     std::cout << "\t\t# path to log file" << std::endl;
@@ -1642,271 +1785,10 @@ void printSampleConfig()
     std::cout << "\t\tport_numbers = 9200,9300,9600" << std::endl << std::endl;
 
     std::cout << "\t\t# path to directory containing files needed to be csv validated" << std::endl;
-    std::cout << "\t\tcsv_path = /tmp/csv_dir" << std::endl;
+    std::cout << "\t\t# csv_path = /tmp/csv_dir" << std::endl;
 }
 
-struct Args
-{
-    std::string indexName;
-    std::string indexType;
-    std::string base64auth;
-    std::string logFile;
-    std::string elasticsearchIP;
-    size_t elasticsearchPort;
-    std::string logstashIP;
-    size_t logstashPort;
-    std::string logstashIPApi;
-    size_t logstashPortApi;
-    bool daemonize;
-	std::string indexFreq;
-
-    std::vector<std::string> systemdS;
-    std::vector<std::string> os;
-    std::vector<std::string> process;
-    std::vector<int> portInUse;
-    std::string csvDir;
-
-    // default values
-    Args():
-        indexName("skimmer"),
-        indexType("_doc"),
-        base64auth("bG9nc2VydmVyOmxvZ3NlcnZlcg=="), // logserver:logserver
-        logFile("/tmp/skimmer.log"),
-        elasticsearchIP("127.0.0.1"),
-        elasticsearchPort(9200),
-        daemonize(false)
-    {};
-
-    void base64Encode(const char* message);
-    int readConfig(const char *filename);
-    int readArgs(int argc, char *argv[]);
-};
-
-int Args::readConfig(const char *filename)
-{
-    std::string content;
-    std::string line;
-    std::string value;
-    std::size_t found;
-    const std::string opt[] = {
-        "index_name",
-        "index_freq",
-        "index_type",
-        "elasticsearch_auth",
-        "elasticsearch_address",
-        "logstash_address",
-        "logstash_api",
-        "log_file",
-        "daemonize",
-        "os_stats",
-        "processes",
-        "systemd_services",
-        "port_numbers",
-        "csv_path"
-    };
-
-
-    if(isFileEmpty(filename, content) != 0) return -1;
-    std::istringstream iss(content);
-    while(std::getline(iss, line))
-    {
-        int index = -1;
-        for(const std::string &i: opt)
-        {
-            index += 1;
-
-            if(!((found = line.find(i)) != std::string::npos && found == 0))
-                continue;
-
-            std::istringstream iline(line);
-            if(!std::getline(iline, value, '='))
-                continue;
-            std::getline(iline, value);
-            value.erase(std::remove(value.begin(), value.end(), ' '), value.end());
-
-            switch(index)
-            {
-                case 0:
-                    indexName = value;
-                break;
-                case 1:
-                    indexFreq = value;
-                break;
-                case 2:
-                    indexType = value;
-                break;
-                case 3:
-                    base64Encode(value.c_str());
-                break;
-                case 4:
-                    {
-                        std::istringstream iarg(value);
-                        std::string token;
-                        if(!std::getline(iarg, token, ':'))
-                            continue;
-                        elasticsearchIP = token;
-
-                        std::getline(iarg, token);
-                        try
-                        {
-                            elasticsearchPort = std::stoi(token);
-                        }
-                        catch(const std::invalid_argument& err)
-                        {
-                            elasticsearchIP.clear();
-                        }
-                    }
-                break;
-                case 5:
-                    {
-                        std::istringstream iarg(value);
-                        std::string token;
-                        if(!std::getline(iarg, token, ':'))
-                            continue;
-                        logstashIP = token;
-
-                        std::getline(iarg, token);
-                        try
-                        {
-                            logstashPort = std::stoi(token);
-                        }
-                        catch(const std::invalid_argument& err)
-                        {
-                            logstashIP.clear();
-                        }
-                    }
-                break;
-                case 6:
-                    {
-                        std::istringstream iarg(value);
-                        std::string token;
-                        if(!std::getline(iarg, token, ':'))
-                            continue;
-                        logstashIPApi = token;
-
-                        std::getline(iarg, token);
-                        try
-                        {
-                            logstashPortApi = std::stoi(token);
-                        }
-                        catch(const std::invalid_argument& err)
-                        {
-                            logstashIPApi.clear();
-                        }
-                    }
-                break;
-                case 7:
-                    logFile = value;
-                break;
-                case 8:
-                    if(value == "true")
-                        daemonize = true;
-                break;
-                case 9:
-                    {
-                        std::istringstream iarg(value);
-                        std::string token;
-                        while(std::getline(iarg, token, ','))
-                            os.push_back(token);
-                    }
-                break;
-                case 10:
-                    {
-                        std::istringstream iarg(value);
-                        std::string token;
-                        while(std::getline(iarg, token, ','))
-                            process.push_back(token);
-                    }
-                break;
-                case 11:
-                    {
-                        std::istringstream iarg(value);
-			            std::string token;
-				        while(std::getline(iarg, token, ','))
-					        systemdS.push_back(token);
-                    }
-                break;
-                case 12:
-                    {
-                        std::istringstream iarg(value);
-				        std::string token;
-				        while(std::getline(iarg, token, ','))
-				        {
-				            try
-				            {
-					            portInUse.push_back(std::stoi(token));
-				            }
-					        catch(const std::invalid_argument& err)
-					        {
-                                portInUse.clear();
-				            }
-			            }
-                    }
-                break;
-                case 13:
-                    csvDir = value;
-                break;
-            }
-        }
-    }
-
-	std::string tmp = indexName;
-    if(indexFreq == "daily")
-        appendDateNow(tmp, "%Y.%m.%d");
-    else if(indexFreq == "monthly")
-        appendDateNow(tmp, "%Y.%m");
-    std::string msg = "Configuration Options: \nIndex Name: " + tmp +
-                        "\nIndex Type: " + indexType +
-                        "\nElasticsearch Auth: " + base64auth +
-                        "\nDaemonize: " + std::to_string(daemonize) +
-                        "\n";
-
-    if(!elasticsearchIP.empty())
-    {
-        msg += "Output Elasticsearch IP: " + elasticsearchIP +
-                "\nOutput Elasticsearch Port: " + std::to_string(elasticsearchPort) +
-                "\n";
-    }
-    if(!logstashIP.empty())
-    {
-        msg += "Output Logstash IP: " + logstashIP +
-                "\nOutput Logstash Port: " + std::to_string(logstashPort) +
-                "\n";
-    }
-
-    if(!logstashIPApi.empty())
-    {
-        msg += "API Logstash IP: " + logstashIPApi +
-                "\nAPI Logstash Port: " + std::to_string(logstashPortApi) +
-                "\n";
-    }
-
-    writeToLog(logFile.c_str(), msg.c_str());
-    return 0;
-}
-
-void Args::base64Encode(const char* message)
-{
-	BIO *bio, *b64;
-	FILE* stream;
-    char *buffer;
-	int encodedSize = 4*ceil((double)strlen(message)/3);
-	buffer = (char *)malloc(encodedSize+1);
-
-	stream = fmemopen(buffer, encodedSize+1, "w");
-	b64 = BIO_new(BIO_f_base64());
-	bio = BIO_new_fp(stream, BIO_NOCLOSE);
-	bio = BIO_push(b64, bio);
-	BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL); //Ignore newlines - write everything in one line
-	BIO_write(bio, message, strlen(message));
-	BIO_flush(bio);
-	BIO_free_all(bio);
-	fclose(stream);
-    base64auth = buffer;
-    free(buffer);
-}
-
-int Args::readArgs(int argc, char *argv[])
+const char *readArgs(int argc, char *argv[])
 {
     int opt;
 
@@ -1916,25 +1798,20 @@ int Args::readArgs(int argc, char *argv[])
 	    {
 		    case 'h':
 			    printHelp();
-                return -1;
+                return NULL;
             case 's':
                 printSampleConfig();
-                return -1;
+                return NULL;
             case 'c':
-                return readConfig(optarg);
-		    default:
+                return optarg;
+            default:
 			    printHelp();
-                return -1;
+                return NULL;
 	    }
     }
 
     printHelp();
-    return -1;
-}
-
-void reap_zombie(int signum)
-{
-    waitpid(-1, NULL, 0);
+    return NULL;
 }
 
 int main(int argc, char *argv[])
@@ -1944,9 +1821,74 @@ int main(int argc, char *argv[])
     // initialize library
     SSL_library_init();
 
-    Args arg;
-    if(arg.readArgs(argc, argv)) return -1;
+    // get config filename
+    const char *filename = NULL;
+    if((filename = readArgs(argc, argv)) == NULL) return -1;
 
+    // read config file
+    std::string err;
+    ConfigFile cf(filename, err);
+    if(!err.empty()) { std::cout << err << std::endl; return -1; }
+
+    bool daemonize;
+    std::string index_name, index_freq, index_type, elasticsearch_auth, log_file, csv_path;
+    std::pair<std::string, int> elasticsearch_address, elasticsearch_api, logstash_address, logstash_api;
+    std::vector<std::string> os_stats, processes, systemd_services;
+    std::vector<int> port_numbers;
+
+    // default values
+    index_name = "skimmer";
+    index_freq = "monthly";
+    index_type = "_doc";
+    elasticsearch_auth = "logserver:logserver";
+    log_file = "/tmp/skimmer.log";
+
+    // values from config file
+    cf.get_value("index_name", index_name);
+    cf.get_value("index_freq", index_freq);
+    cf.get_value("index_type", index_type);
+    cf.get_value("elasticsearch_auth", elasticsearch_auth);
+    cf.get_value("elasticsearch_address", elasticsearch_address);
+    cf.get_value("elasticsearch_api", elasticsearch_api);
+    cf.get_value("logstash_address", logstash_address);
+    cf.get_value("logstash_api", logstash_api);
+    cf.get_value("log_file", log_file);
+    cf.get_value("daemonize", daemonize);
+    cf.get_value("os_stats", os_stats);
+    cf.get_value("processes", processes);
+    cf.get_value("systemd_services", systemd_services);
+    cf.get_value("port_numbers", port_numbers);
+    cf.get_value("csv_path", csv_path);
+
+    // conversion
+    std::string base64auth;
+    base64Encode(elasticsearch_auth.c_str(), base64auth);
+
+    // check if log is writable
+    std::ofstream ofs(log_file);
+    if(!ofs.good()) { std::cout << "Could not open log file for writing" << std::endl; return -1; }
+    ofs.close();
+
+    // logging
+    std::string msg = "Skimmer version " + std::string(VERSION) + " started\n";
+    writeToLog(log_file.c_str(), msg.c_str());
+
+    msg = "The following settings are used:\n";
+    msg += "Index Name: " + index_name + " created " + index_freq + "\n";
+    msg += "Index Type: " + index_type + "\n";
+    msg += "Elasticsearch Auth: " + elasticsearch_auth + "\n";
+    msg += "Log File: " + log_file + "\n";
+
+    if(!elasticsearch_address.first.empty()) msg += "Elasticsearch Output - IP: " + elasticsearch_address.first + ", Port: " + std::to_string(elasticsearch_address.second) + "\n";
+    if(!elasticsearch_api.first.empty()) msg += "Elasticsearch API - IP: " + elasticsearch_api.first + ", Port: " + std::to_string(elasticsearch_api.second) + "\n";
+    if(!logstash_address.first.empty()) msg += "Logstash Output - IP: " + logstash_address.first + ", Port: " + std::to_string(logstash_address.second) + "\n";
+    if(!logstash_api.first.empty()) msg += "Logstash API - IP: " + logstash_api.first + ", Port: " + std::to_string(logstash_api.second) + "\n";
+    if(!os_stats.empty()) { msg += "OS Statistics: "; for(const std::string &i: os_stats) { msg += i; msg += " "; } msg += "\n"; }
+    if(!processes.empty()) { msg += "Processes: "; for(const std::string &i: processes) { msg += i; msg += " "; } msg += "\n"; }
+    if(!systemd_services.empty()) { msg += "Systemd Services: "; for(const std::string &i: systemd_services) { msg += i; msg += " "; } msg += "\n"; }
+    if(!port_numbers.empty()) { msg += "Port Numbers: "; for(const int &i: port_numbers) { msg += std::to_string(i); msg += " "; } msg += "\n"; }
+    if(!csv_path.empty()) msg += "CSV Path: " + csv_path + "\n";
+    writeToLog(log_file.c_str(), msg.c_str());
 
     // child code
     if(fork() == 0)
@@ -1955,110 +1897,104 @@ int main(int argc, char *argv[])
         pid_t pid = fork();
         if(pid == 0) 
         {
-			if(arg.indexFreq == "daily")
-                appendDateNow(arg.indexName, "%Y.%m.%d");
-            else if(arg.indexFreq == "monthly")
-                appendDateNow(arg.indexName, "%Y.%m");
+            writeToLog(log_file.c_str(), "Started a new process\n");
+
+			if(index_freq == "daily")
+                appendDateNow(index_name, "%Y.%m.%d");
+            else if(index_freq == "monthly")
+                appendDateNow(index_name, "%Y.%m");
 
             // Stats common for all nodes
             std::string ip = hostname_ip()["source_node_ip"];
-            std::string os_stats;
-            os_stats = os_stats + hostname_ip();
+            std::string stats_all;
+            stats_all = stats_all + hostname_ip();
 
-            for(const std::string &str: arg.os)
+            for(const std::string &str: os_stats)
 	        {
                 if(str == "zombie")
                 {
-                    os_stats = os_stats + zombie_count();
+                    stats_all = stats_all + zombie_count();
                 }
                 else if(str == "vm")
                 {
-                    os_stats = os_stats + vm_stats();
+                    stats_all = stats_all + vm_stats();
                 }
                 else if(str == "fs")
                 {
-                    os_stats = os_stats + fs_stats();
+                    stats_all = stats_all + fs_stats();
                 }
                 else if(str == "swap")
                 {
-                    os_stats = os_stats + swap_stats();
+                    stats_all = stats_all + swap_stats();
                 }
                 else if(str == "net")
                 {
-                    os_stats = os_stats + net_stats();
+                    stats_all = stats_all + net_stats();
                 }
                 else if(str == "cpu")
                 {
-                    os_stats = os_stats + cpu_stats();
+                    stats_all = stats_all + cpu_stats();
                 }
 	        }
-            for(const std::string &str: arg.process)
+            for(const std::string &str: processes)
 	        {
-		        os_stats = os_stats + process_pid(str.c_str());
+		        stats_all = stats_all + process_pid(str.c_str());
 	        }
-	        for(const std::string &str: arg.systemdS)
+	        for(const std::string &str: systemd_services)
 	        {
-		        os_stats = os_stats + systemd_service_status(str);
+		        stats_all = stats_all + systemd_service_status(str, false);
 	        }
-	        for(int port: arg.portInUse)
+	        for(int port: port_numbers)
 	        {
-		        os_stats = os_stats + is_address_in_use(ip, port);
+		        stats_all = stats_all + is_address_in_use(ip, port, false);
 	        }
 
-            if(!arg.csvDir.empty()) checkCsvByPattern(arg.csvDir.c_str(), arg.logFile.c_str());
+            if(!csv_path.empty()) checkCsvByPattern(csv_path.c_str(), log_file.c_str());
 
-            // send os and elasticsearch api data
-            try
-            {
-                // NODE DATA
-                NodeStats node(arg.base64auth, arg.elasticsearchIP, arg.elasticsearchPort);
+            // send os stats
+            sendDataToElasticsearch(elasticsearch_address, index_name, index_type, base64auth, stats_all, log_file.c_str());
+            sendDataToLogstash(logstash_address, stats_all);
 
-                node.sendDataToElasticsearch(os_stats, arg.indexName, arg.indexType);
-                node.sendDataToElasticsearch(node.get_api_stats(), arg.indexName, arg.indexType);
+            try {
+                ElasticsearchStats elasticsearch(elasticsearch_api, base64auth);
 
-                if(!arg.logstashIP.empty())
-                {
-                    sendData(os_stats.c_str(), arg.logstashIP.c_str(), arg.logstashPort);
-                    sendData(node.get_api_stats().c_str(), arg.logstashIP.c_str(), arg.logstashPort);
-                }
+                // get data
+                std::string node_data = elasticsearch.get_node_stats();
+                std::string cluster_data = elasticsearch.get_cluster_stats();
 
-                // CLUSTER DATA
-                ClusterStats cluster(arg.base64auth, arg.elasticsearchIP, arg.elasticsearchPort);
+                // send to elasticsearch
+                sendDataToElasticsearch(elasticsearch_address, index_name, index_type, base64auth, node_data, log_file.c_str());
+                sendDataToElasticsearch(elasticsearch_address, index_name, index_type, base64auth, cluster_data, log_file.c_str());
 
-                cluster.sendDataToElasticsearch(cluster.get_api_stats(), arg.indexName, arg.indexType);
-
-                if(!arg.logstashIP.empty())
-                    sendData(cluster.get_api_stats().c_str(), arg.logstashIP.c_str(), arg.logstashPort);
+                // send to logstash
+                sendDataToLogstash(logstash_address, node_data);
+                sendDataToLogstash(logstash_address, cluster_data);
             }
-            catch(const std::runtime_error &error)
-            {
-                std::cerr << error.what() << std::endl;
+            catch(const std::runtime_error &error) {
+                writeToLog(log_file.c_str(), error.what());
             }
 
-            // send logstash api data
-            if(!arg.logstashIPApi.empty())
-            {
-                try
-                {
-                    Node node(arg.base64auth, arg.elasticsearchIP, arg.elasticsearchPort);
-                    LogstashStats object(arg.logstashIPApi, arg.logstashPortApi);
+            try {
+                LogstashStats logstash(logstash_api);
 
-                    node.sendDataToElasticsearch(object.get_api_stats(), arg.indexName, arg.indexType);
+                // get data
+                std::string logstash_data = logstash.get_api_stats();
 
-                    if(!arg.logstashIP.empty())
-                        sendData(object.get_api_stats().c_str(), arg.logstashIP.c_str(), arg.logstashPort);
-                }
-                catch(const std::runtime_error &error)
-                {
-                    std::cerr << error.what() << std::endl;
-                }
+                // send data to elasticsearch
+                sendDataToElasticsearch(elasticsearch_address, index_name, index_type, base64auth, logstash_data, log_file.c_str());
+
+                // send data to logstash
+                sendDataToLogstash(logstash_address, logstash_data);
+            }
+            catch(const std::runtime_error &error) {
+                writeToLog(log_file.c_str(), error.what());
             }
 
             exit(0); // exit child
         }
         else
         {
-	    if(arg.daemonize)
+	    if(daemonize)
             {
                 struct sigaction s;
                 s.sa_handler = reap_zombie;
@@ -2069,7 +2005,7 @@ int main(int argc, char *argv[])
             else
                 waitpid(pid, NULL, 0);
         }
-        } while(arg.daemonize);
+        } while(daemonize);
     }
 
     // orphaning child
