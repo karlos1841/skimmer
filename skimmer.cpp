@@ -25,6 +25,7 @@
  *          + source_node_ip field is an elasticsearch array now
  * 1.0.10 - added PSexec module responsible for running powershell scripts remotely, rewritten main function to use threads for each module, reorganized sample config file,
  *          abandoned daemonize option, fixed segfault occuring on some systems when retrieving local ip addresses, added new metrics described in issue#126
+ * 1.0.10a- fixed timestamp appending to index name
 */
 #include <iostream>
 #include <cstdio>
@@ -74,7 +75,7 @@
 #define MAX_PORT    65535
 #define SLEEP_US    100000
 #define MODULES     2
-#define VERSION     "1.0.10"
+#define VERSION     "1.0.10a"
 
 // PSexec module
 // marks end of connection
@@ -840,8 +841,6 @@ std::ostream &operator<<(std::ostream &stream, const std::unordered_map<std::str
     }
     return stream;
 }
-template std::ostream &operator<<(std::ostream &stream, const std::unordered_map<std::string, std::string> &map);
-template std::ostream &operator<<(std::ostream &stream, const std::unordered_map<std::string, uint64_t> &map);
 
 template<typename T>
 std::string &operator<<(std::string &output, const std::map<std::string, T> &map)
@@ -857,7 +856,6 @@ std::string &operator<<(std::string &output, const std::map<std::string, T> &map
     output += ss.str();
     return output;
 }
-template std::string &operator<<(std::string &output, const std::map<std::string, std::string> &map);
 
 template<typename T>
 std::string &operator<<(std::string &output, const std::unordered_map<std::string, T> &map)
@@ -886,8 +884,6 @@ std::string &operator<<(std::string &output, const std::unordered_map<std::strin
     output += ss.str();
     return output;
 }
-template std::string &operator<<(std::string &output, const std::unordered_map<std::string, std::string> &map);
-template std::string &operator<<(std::string &output, const std::unordered_map<std::string, uint64_t> &map);
 
 template<typename T>
 std::string &operator<<(std::string &output, const std::vector<T> &vec)
@@ -937,7 +933,6 @@ std::string &operator<<(std::string &output, const std::vector<T> &vec)
     output += ss.str();
     return output;
 }
-template std::string &operator<<(std::string &output, const std::vector<std::string> &vec);
 
 template<typename T>
 std::string &operator+(std::string &sum, const std::map<std::string, T> &map)
@@ -960,7 +955,6 @@ std::string &operator+(std::string &sum, const std::map<std::string, T> &map)
 
     return sum;
 }
-template std::string &operator+(std::string &sum, const std::map<std::string, std::string> &map);
 
 template<typename T>
 std::string &operator+(std::string &sum, const std::unordered_map<std::string, T> &map)
@@ -983,8 +977,6 @@ std::string &operator+(std::string &sum, const std::unordered_map<std::string, T
 
     return sum;
 }
-template std::string &operator+(std::string &sum, const std::unordered_map<std::string, std::string> &map);
-template std::string &operator+(std::string &sum, const std::unordered_map<std::string, uint64_t> &map);
 /*** END OF GENERIC HELPER FUNCTIONS ***/
 /***************************************/
 /***************************************/
@@ -1955,14 +1947,14 @@ bool is_address_in_use(const std::string &ip, const int port)
 /***************************************/
 /***************************************/
 
-void appendDateNow(std::string &arg, const char *dateFormat)
+std::string appendDateNow(const std::string &arg, const char *dateFormat)
 {
 	struct tm *timeinfo;
 	time_t rawtime = time(NULL);
 	char timestamp[20];
 	timeinfo = gmtime(&rawtime);
 	strftime(timestamp, sizeof(timestamp), dateFormat, timeinfo);
-	arg = arg + "-" + timestamp;
+	return arg + "-" + timestamp;
 }
 
 int isStrCsv(const std::string &str, const char delim)
@@ -2422,10 +2414,11 @@ void *Main(void *arg)
     struct timeval  tv1, tv2;
     gettimeofday(&tv1, NULL);
 
+    std::string index_name_now = index_name;
     if(index_freq == "daily")
-        appendDateNow(index_name, "%Y.%m.%d");
+        index_name_now = appendDateNow(index_name, "%Y.%m.%d");
     else if(index_freq == "monthly")
-        appendDateNow(index_name, "%Y.%m");
+        index_name_now = appendDateNow(index_name, "%Y.%m");
 
 
     // Stats common for all nodes
@@ -2497,7 +2490,7 @@ void *Main(void *arg)
         pthread_mutex_unlock(&mutex);
     }
     pthread_mutex_lock(&mutex);
-        sendDataToElasticsearch(debug, elasticsearch_address, index_name, index_type, base64auth, stats_all, log_file.c_str());
+        sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, stats_all, log_file.c_str());
         sendDataToLogstash(logstash_address, stats_all);
     pthread_mutex_unlock(&mutex);
 
@@ -2535,8 +2528,8 @@ void *Main(void *arg)
 
         pthread_mutex_lock(&mutex);
             // send data to elasticsearch
-            sendDataToElasticsearch(debug, elasticsearch_address, index_name, index_type, base64auth, node_data, log_file.c_str());
-            sendDataToElasticsearch(debug, elasticsearch_address, index_name, index_type, base64auth, cluster_data, log_file.c_str());
+            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, node_data, log_file.c_str());
+            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, cluster_data, log_file.c_str());
 
             // send data to logstash
             sendDataToLogstash(logstash_address, node_data);
@@ -2570,7 +2563,7 @@ void *Main(void *arg)
 
         pthread_mutex_lock(&mutex);
             // send data to elasticsearch
-            sendDataToElasticsearch(debug, elasticsearch_address, index_name, index_type, base64auth, logstash_data, log_file.c_str());
+            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, logstash_data, log_file.c_str());
 
             // send data to logstash
             sendDataToLogstash(logstash_address, logstash_data);
@@ -2784,7 +2777,7 @@ void printSampleConfig()
     std::cout << "# path to directory containing files needed to be csv validated" << std::endl;
     std::cout << "# csv_path = /tmp/csv_dir" << std::endl << std::endl;
 
-    std::cout << "[PSexec] - run powershell command remotely (skimmer must be installed on Windows)" << std::endl;
+    std::cout << "[PSexec] - run powershell script remotely (skimmer must be installed on Windows)" << std::endl;
     std::cout << "ps_enabled = false" << std::endl;
     std::cout << "# port used to establish connection" << std::endl;
     std::cout << "# ps_port = 10000" << std::endl << std::endl;
