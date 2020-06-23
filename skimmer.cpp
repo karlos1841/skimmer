@@ -1,6 +1,6 @@
 /*
  * Linux
- * g++ -std=c++11 -pedantic -Wall -Wextra skimmer.cpp -o skimmer -lssl -lcrypto -pthread
+ * g++ -std=c++11 -pedantic -Wall -Wextra $(pkg-config dbus-1 --cflags) skimmer.cpp -o skimmer -lssl -lcrypto -pthread -ldbus-1
  *
  * Windows
  * g++ -std=c++11 -pedantic -Wall -Wextra skimmer.cpp -o skimmer -lws2_32
@@ -26,6 +26,8 @@
  * 1.0.10 - added PSexec module responsible for running powershell scripts remotely, rewritten main function to use threads for each module, reorganized sample config file,
  *          abandoned daemonize option, fixed segfault occuring on some systems when retrieving local ip addresses, added new metrics described in issue#126
  * 1.0.10a- fixed timestamp appending to index name
+ * 1.0.11 - new metrics added
+ * 1.0.12 - rewritten querying service status to use dbus api
 */
 #include <iostream>
 #include <cstdio>
@@ -50,6 +52,7 @@
 #include <fstream>
 #include <typeinfo>
 #include <ctime>
+#include <chrono>
 #include <algorithm>
 #include <unistd.h>
 #include <mntent.h>
@@ -67,6 +70,7 @@
 #include <openssl/ssl.h>
 #include <ifaddrs.h>
 #include <pthread.h>
+#include <dbus/dbus.h>
 #endif
 
 #define IP_MAX      16
@@ -75,7 +79,7 @@
 #define MAX_PORT    65535
 #define SLEEP_US    100000
 #define MODULES     2
-#define VERSION     "1.0.10a"
+#define VERSION     "1.0.12"
 
 // PSexec module
 // marks end of connection
@@ -445,6 +449,105 @@ std::unordered_map<std::string, std::string> systemd_service_status(const std::s
 /********************************/
 /********************************/
 /*** GENERIC HELPER FUNCTIONS ***/
+class DBus
+{
+    DBusConnection *connection;
+    DBusError error;
+
+    std::string object_parse(const std::string &object);
+
+    public:
+        DBus(): connection(NULL)
+        {
+            // init error
+            dbus_error_init(&error);
+            // connect to system bus
+            connection = dbus_bus_get(DBUS_BUS_SYSTEM, &error);
+            if(connection == NULL) throw NULL;
+        };
+        ~DBus()
+        {
+            dbus_connection_unref(connection);
+            if(dbus_error_is_set(&error)) dbus_error_free(&error);
+        };
+
+        std::string get_error()
+        {
+            if(dbus_error_is_set(&error))
+                return std::string(error.name) + ": " + std::string(error.message);
+
+            return "";
+        };
+
+        const char *get_systemd_object_state(const std::string &object);
+};
+
+std::string DBus::object_parse(const std::string &object)
+{
+    std::string object_parsed;
+    // the most common replacements
+    char replace[] = {'.', '-', '_', '@'};
+    const char *replace_with[] = { "_2e", "_2d", "_5f", "_40" };
+
+    for(char c: object)
+    {
+        bool replaced = false;
+        size_t index = 0;
+        for(char r: replace)
+        {
+            if(c == r)
+            {
+                object_parsed += replace_with[index];
+                replaced = true;
+                break;
+            }
+            index += 1;
+        }
+
+        if(!replaced)
+            object_parsed.push_back(c);
+    }
+
+    return object_parsed;
+}
+
+const char *DBus::get_systemd_object_state(const std::string &object)
+{
+    DBusMessage *msg = NULL;
+    DBusMessage *reply = NULL;
+    std::string systemd_service_path = "org.freedesktop.systemd1";
+    std::string systemd_object_path = "/org/freedesktop/systemd1/unit/" + object_parse(object);
+
+    // build method call
+    msg = dbus_message_new_method_call(systemd_service_path.c_str(), systemd_object_path.c_str(), "org.freedesktop.DBus.Properties", "Get");
+
+    // pass arguments to method
+    const char *msg_interface = "org.freedesktop.systemd1.Unit";
+    const char *msg_property = "ActiveState";
+    dbus_message_append_args(msg, DBUS_TYPE_STRING, &msg_interface, DBUS_TYPE_STRING, &msg_property, DBUS_TYPE_INVALID);
+
+    // send and wait for reply
+    reply = dbus_connection_send_with_reply_and_block(connection, msg, DBUS_TIMEOUT_USE_DEFAULT, &error);
+    if(reply == NULL) return NULL;
+
+    // decode reply
+    DBusMessageIter iter;
+    dbus_message_iter_init(reply, &iter);
+    if(DBUS_TYPE_VARIANT != dbus_message_iter_get_arg_type(&iter)) return NULL;
+
+    DBusMessageIter sub;
+    dbus_message_iter_recurse(&iter, &sub);
+
+    const char *result = NULL;
+    dbus_message_iter_get_basic(&sub, &result);
+
+    // decrement ref
+    dbus_message_unref(msg);
+    dbus_message_unref(reply);
+
+    return result;
+}
+
 int getCommandOutput(const std::string &command, std::string &output)
 {
     FILE *f = NULL;
@@ -981,6 +1084,11 @@ std::string &operator+(std::string &sum, const std::unordered_map<std::string, T
 /***************************************/
 /***************************************/
 
+struct PreviousAPICall {
+     double previousDocumentsCount = 0.00;
+     std::chrono::time_point<std::chrono::high_resolution_clock> previousCallTime;
+     bool initialized = false;
+};
 
 /***************************************/
 /***************************************/
@@ -1010,7 +1118,7 @@ class ElasticsearchStats
     const char *cluster_pending_tasks_response;
 
     std::unordered_map<std::string, long double> node_stats();
-    std::unordered_map<std::string, uint64_t> cluster_stats();
+    std::unordered_map<std::string, double> cluster_stats(PreviousAPICall &previousAPICall);
     std::unordered_map<std::string, long double> cluster_health();
     std::unordered_map<std::string, uint64_t> cluster_pending_tasks();
 
@@ -1084,12 +1192,12 @@ class ElasticsearchStats
         return json_output;
     };
 
-    std::string get_cluster_stats()
+    std::string get_cluster_stats(PreviousAPICall &previousAPICall)
     {
         if(cluster_response == NULL || cluster_health_response == NULL || cluster_pending_tasks_response == NULL) return "";
 
         std::string json_output;
-        json_output = json_output + api_timestamp(cluster_response) + get_hostname() + get_ip() + cluster_stats() + cluster_health() + cluster_pending_tasks();
+        json_output = json_output + api_timestamp(cluster_response) + get_hostname() + get_ip() + cluster_stats(previousAPICall) + cluster_health() + cluster_pending_tasks();
 
         return json_output;
     };
@@ -1156,7 +1264,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::node_stats()
     node_response = remove_headers((char **)&node_response);
     const char *value = NULL;
 
-    const int col = 63;
+    const int col = 70;
     const int row = 10;
     const char *keys[col][row] =
     {
@@ -1201,11 +1309,18 @@ std::unordered_map<std::string, long double> ElasticsearchStats::node_stats()
         {"indices", "refresh", "total_time_in_millis", NULL},
         {"indices", "flush", "total", NULL},
         {"indices", "flush", "total_time_in_millis", NULL},
+        {"indices", "merges", "total_time_in_millis", NULL},
+        {"indices", "merges", "total", NULL},
         {"os", "cpu", "percent", NULL},
         {"os", "mem", "total_in_bytes", NULL},
         {"os", "mem", "free_in_bytes", NULL},
         {"os", "swap", "total_in_bytes", NULL},
         {"os", "swap", "free_in_bytes", NULL},
+        {"io_stats", "total", "operations", NULL},
+        {"io_stats", "total", "read_operations", NULL},
+        {"io_stats", "total", "write_operations", NULL},
+        {"io_stats", "total", "read_kilobytes", NULL},
+        {"io_stats", "total", "write_kilobytes", NULL},
         {"process", "open_file_descriptors", NULL},
         {"process", "max_file_descriptors", NULL},
         {"process", "cpu", "percent", NULL},
@@ -1256,6 +1371,8 @@ std::unordered_map<std::string, long double> ElasticsearchStats::node_stats()
 
     if(stats.at("node_stats_jvm_gc_collectors_old_collection_count") != 0)
         stats.insert({"node_stats_jvm_gc_collectors_old_collection_duration", stats.at("node_stats_jvm_gc_collectors_old_collection_time_in_millis") / stats.at("node_stats_jvm_gc_collectors_old_collection_count")});
+    else if(stats.at("node_stats_jvm_gc_collectors_old_collection_count") == 0 && stats.at("node_stats_jvm_gc_collectors_old_collection_time") == 0)
+        stats.insert({"node_stats_jvm_gc_collectors_old_collection_duration", 0});
 
     if(stats.at("node_stats_jvm_gc_collectors_young_collection_count") != 0)
         stats.insert({"node_stats_jvm_gc_collectors_young_collection_duration", stats.at("node_stats_jvm_gc_collectors_young_collection_time_in_millis") / stats.at("node_stats_jvm_gc_collectors_young_collection_count")});
@@ -1265,6 +1382,11 @@ std::unordered_map<std::string, long double> ElasticsearchStats::node_stats()
 
     if(stats.at("node_stats_indices_refresh_total") != 0)
         stats.insert({"node_stats_indices_refresh_duration", stats.at("node_stats_indices_refresh_total_time_in_millis") / stats.at("node_stats_indices_refresh_total")});
+
+    if(stats.at("node_stats_indices_merges_total") != 0)
+        stats.insert({"node_stats_indices_merges_duration", stats.at("node_stats_indices_merges_total_time_in_millis") / stats.at("node_stats_indices_merges_total")});
+    else if(stats.at("node_stats_indices_merges_total") == 0)
+        stats.insert({"node_stats_indices_merges_duration", 0});
     }
     catch (const std::out_of_range& oor) {
         // handle oor
@@ -1282,7 +1404,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::cluster_health(
 
     const int col = 7;
     const int row = 2;
-    const char *keys[col][row] = 
+    const char *keys[col][row] =
     {
         {"active_shards_percent_as_number", NULL},
         {"status", NULL},
@@ -1320,10 +1442,11 @@ std::unordered_map<std::string, long double> ElasticsearchStats::cluster_health(
     return stats;
 }
 
-std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_stats()
+std::unordered_map<std::string, double> ElasticsearchStats::cluster_stats(PreviousAPICall &previousAPICall)
 {
-    std::unordered_map<std::string, uint64_t> stats;
+    std::unordered_map<std::string, double> stats;
     if(getHttpStatus(cluster_response) != 200) return stats;
+    auto currentAPICallTime = std::chrono::high_resolution_clock::now();
     cluster_response = remove_headers((char **)&cluster_response);
     const char *value = NULL;
 
@@ -1387,7 +1510,21 @@ std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_stats()
                 description += keys[i][j];
             }
 
-            stats.insert({description, strtol(value, NULL, 0)});
+            double numberValue = strtol(value, NULL, 0);
+            stats.insert({description, numberValue});
+
+            if(description == "cluster_stats_indices_docs_count")
+            {
+                if(previousAPICall.previousDocumentsCount > 0 && previousAPICall.initialized)
+                {
+                     double timeDifference = (std::chrono::duration<double, std::milli>(currentAPICallTime - previousAPICall.previousCallTime).count()) / 1000;
+                     stats.insert({"cluster_stats_indices_docs_per_sec", (double)(numberValue - previousAPICall.previousDocumentsCount) / timeDifference});
+                }
+
+                previousAPICall.previousDocumentsCount = numberValue;
+                previousAPICall.previousCallTime = currentAPICallTime;
+                previousAPICall.initialized = true;
+            }
         }
     }
 
@@ -1397,14 +1534,14 @@ std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_stats()
 std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_pending_tasks()
 {
     std::unordered_map<std::string, uint64_t> stats;
-    
+
     if(getHttpStatus(cluster_pending_tasks_response) != 200) return stats;
     cluster_pending_tasks_response = remove_headers((char **)&cluster_pending_tasks_response);
     std::string json_response(this->cluster_pending_tasks_response);
-    
+
     std::size_t found = -1;
     uint64_t pending_tasks_total = -1;
-    while((found = json_response.find('{', found + 1)) != std::string::npos) 
+    while((found = json_response.find('{', found + 1)) != std::string::npos)
     {
         ++pending_tasks_total;
     }
@@ -1413,7 +1550,7 @@ std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_pending_ta
 
     found = -1;
     uint64_t pending_tasks_urgent = 0;
-    while((found = json_response.find("URGENT", found + 1)) != std::string::npos) 
+    while((found = json_response.find("URGENT", found + 1)) != std::string::npos)
     {
         ++pending_tasks_urgent;
     }
@@ -1422,7 +1559,7 @@ std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_pending_ta
 
     found = -1;
     uint64_t pending_tasks_high = 0;
-    while((found = json_response.find("HIGH", found + 1)) != std::string::npos) 
+    while((found = json_response.find("HIGH", found + 1)) != std::string::npos)
     {
         ++pending_tasks_high;
     }
@@ -1894,9 +2031,13 @@ std::unordered_map<std::string, uint64_t> vm_stats()
 std::unordered_map<std::string, std::string> systemd_service_status(const std::string &service, bool skip_unknown = true)
 {
     std::unordered_map<std::string, std::string> service_status;
-    std::string status;
-    if(getCommandOutput("systemctl is-active " + service, status) != -1)
-    {
+
+    DBus d;
+    const char *result = d.get_systemd_object_state(service + ".service");
+    if(result == NULL) return service_status;
+
+    std::string status = result;
+
 	if(skip_unknown)
 	{
 		if(status != "unknown") service_status.insert({"node_stats_systemd_service_" + service, status});
@@ -1905,7 +2046,6 @@ std::unordered_map<std::string, std::string> systemd_service_status(const std::s
 	{
 		service_status.insert({"node_stats_systemd_service_" + service, status});
 	}
-    }
 
     return service_status;
 }
@@ -2405,6 +2545,7 @@ void *Main(void *arg)
         writeToLog(INFO, log_file.c_str(), msg.c_str());
     pthread_mutex_unlock(&mutex);
 
+    PreviousAPICall previousAPICall;
 
     const size_t uwait = 60000000; // wait 1 minute
     // infinite loop
@@ -2498,8 +2639,10 @@ void *Main(void *arg)
         ElasticsearchStats elasticsearch(elasticsearch_api, base64auth);
 
         // get data
+        pthread_mutex_lock(&mutex);
         std::string node_data = elasticsearch.get_node_stats();
-        std::string cluster_data = elasticsearch.get_cluster_stats();
+        std::string cluster_data = elasticsearch.get_cluster_stats(previousAPICall);
+        pthread_mutex_unlock(&mutex);
         if(debug) {
             if(!cluster_data.empty()) {
                 std::string msg = "Elasticsearch Cluster Stats: " + cluster_data;
