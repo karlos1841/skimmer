@@ -28,6 +28,11 @@
  * 1.0.10a- fixed timestamp appending to index name
  * 1.0.11 - new metrics added
  * 1.0.12 - rewritten querying service status to use dbus api
+ * 1.0.13 - fixed negative indexing rate value
+ * 1.0.14 - added expected_data_nodes metric and kafka monitoring - consumers lag metric
+ * 1.0.14a- fixed MSVC compiler warnings and other changes for PSexec module
+ * 1.0.15 - added interval option, indices stats monitoring and nlohmann/json library
+ * 1.0.15a- indices stats monitoring broken up into multiple documents
 */
 #include <iostream>
 #include <cstdio>
@@ -71,6 +76,9 @@
 #include <ifaddrs.h>
 #include <pthread.h>
 #include <dbus/dbus.h>
+
+#include "json.hpp"
+using json = nlohmann::json;
 #endif
 
 #define IP_MAX      16
@@ -79,7 +87,7 @@
 #define MAX_PORT    65535
 #define SLEEP_US    100000
 #define MODULES     2
-#define VERSION     "1.0.12"
+#define VERSION     "1.0.15a"
 
 // PSexec module
 // marks end of connection
@@ -107,17 +115,6 @@ unsigned long hostnameToIP(const char *hostname)
 }
 
 #ifdef _WIN32
-struct PS_CLIENT
-{
-    SOCKET s;
-    WSADATA wsa;
-    char *command;      // command/script sent from remote host
-    char *ps1_path;     // full path to skimmer.ps1 which contains command to execute
-    char *dat_path;     // full path to skimmer.dat where result from running skimmer.ps1 is stored
-    wchar_t *output;    // contents of skimmer.dat
-};
-struct PS_CLIENT ps_client;
-
 int writeToFile(FILE *f, const char *str)
 {
     if(fputs(str, f) < 0)
@@ -176,7 +173,9 @@ int writeWcToSocket(SOCKET *s, const wchar_t *str)
         }
 
         // convert wchar_t to multibyte char and write to buffer updating len
-        len += wcrtomb(buffer + len, *str, NULL);
+        size_t pReturnValue;
+        if(wcrtomb_s(&pReturnValue, buffer + len, sizeof(wchar_t), *str, NULL) != 0) return -1;
+        len += pReturnValue;
         ++str;
     }
 
@@ -218,46 +217,6 @@ char *readFromSocket(SOCKET *s)
     return buffer;
 }
 
-int manageConnection(int *new_conn, WSADATA *wsa, SOCKET *s, const char *host, unsigned short port, int delay)
-{
-    static int first = 1;
-
-    // clean up if it's new and not the first connection
-    if(*new_conn && !first) {
-        closesocket(*s);
-        WSACleanup();
-    }
-
-    // if connection is not new then skip this part
-    if(*new_conn) {
-        // turn off first connection flag
-        first = 0;
-
-        struct sockaddr_in server_info;
-        if(WSAStartup(MAKEWORD(2,2), wsa) != 0) return -1;
-        if((*s = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) return -1;
-
-        memset(&server_info, 0, sizeof(server_info));
-        server_info.sin_family = AF_INET;
-        server_info.sin_port = htons(port);
-
-        if((server_info.sin_addr.s_addr = hostnameToIP(host)) == 0) return -1;
-
-        if(connect(*s, (struct sockaddr *)&server_info, sizeof(server_info)) != 0)
-        {
-            Sleep(delay * 1000);
-            return -1;
-        }
-
-        fprintf(stderr, "Established connection to server\n");
-    }
-
-    // reset to a new connection
-    *new_conn = 1;
-
-    return 0;
-}
-
 void printHelp()
 {
     std::cout << "Usage for skimmer version " << VERSION << " <PSexec module>" << std::endl;
@@ -266,12 +225,149 @@ void printHelp()
     std::cout << "\t-d how often (in seconds) to send SYN packet when setting up connection for the first time (default 60)" << std::endl;
 }
 
+struct PS_PATH
+{
+    char *ps1;          // full path to skimmer.ps1 which contains command to execute
+    char *dat;          // full path to skimmer.dat where result from running skimmer.ps1 is stored
+    char *appdata;      // path to appdata where skimmer related files are stored
+
+    PS_PATH(): ps1(NULL), dat(NULL), appdata(NULL)
+    {
+        // get APPDATA path
+        size_t appdata_len;
+        if(_dupenv_s(&appdata, &appdata_len, "APPDATA") != 0) throw nullptr;
+
+        // path to skimmer.ps1
+        const char* ps1_suffix = "\\skimmer.ps1";
+        size_t ps1_buf = appdata_len + strlen(ps1_suffix) + 1;
+        ps1 = (char *)malloc(ps1_buf * sizeof(char));
+        if(ps1 == NULL) throw nullptr;
+        snprintf(ps1,
+                ps1_buf,
+                "%s%s",
+                appdata,
+                ps1_suffix);
+
+        // path to skimmer.dat
+        const char* dat_suffix = "\\skimmer.dat";
+        size_t dat_buf = appdata_len + strlen(dat_suffix) + 1;
+        dat = (char *)malloc(dat_buf * sizeof(char));
+        if(dat == NULL) throw nullptr;
+        snprintf(dat,
+                dat_buf,
+                "%s%s",
+                appdata,
+                dat_suffix);
+    }
+    ~PS_PATH()
+    {
+        free(appdata);
+        free(dat);
+        free(ps1);
+    }
+};
+
+struct PS_STATE
+{
+    SOCKET s;
+    WSADATA wsa;
+    int wsa_state;
+    bool new_conn;
+
+    PS_STATE(): s(INVALID_SOCKET), wsa_state(-1), new_conn(true) {}
+};
+
+class PS_CLIENT
+{
+    PS_STATE *state;
+
+    char *command;      // command/script sent from remote host
+    wchar_t *output;    // contents of skimmer.dat
+    char *ps_command;   // powershell command to run locally
+
+    public:
+        PS_CLIENT(PS_STATE *state, const char *host, unsigned int port): state(state), command(NULL), output(NULL), ps_command(NULL)
+        {
+            // clean up if it's a new connection
+            if(state->new_conn)
+            {
+                if(state->s != INVALID_SOCKET)
+                    closesocket(state->s);
+                if(state->wsa_state == 0)
+                    WSACleanup();
+
+                state->s = INVALID_SOCKET;
+                state->wsa_state = -1;
+
+                // establish connection
+                struct sockaddr_in server_info;
+                if((state->wsa_state = WSAStartup(MAKEWORD(2,2), &state->wsa)) != 0) throw nullptr;
+                if((state->s = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) throw nullptr;
+
+                memset(&server_info, 0, sizeof(server_info));
+                server_info.sin_family = AF_INET;
+                server_info.sin_port = htons(port);
+
+                if((server_info.sin_addr.s_addr = hostnameToIP(host)) == 0) throw nullptr;
+
+                if(connect(state->s, (struct sockaddr *)&server_info, sizeof(server_info)) != 0) throw nullptr;
+
+                fprintf(stderr, "Established connection to server\n");
+            }
+        }
+
+        int run(const PS_PATH &path)
+        {
+            // get command/script from remote host
+            command = readFromSocket(&state->s);
+
+            // abort if an error occurred or peer closed the connection by sending only one segment of END 0 bytes
+            if(command == NULL || strncmp(command, end, END) == 0) return -1;
+
+            // write command/script to skimmer.ps1
+            FILE *f_ps1;
+            if(fopen_s(&f_ps1, path.ps1, "w") != 0) return -1;
+            if(writeToFile(f_ps1, command) != 0) { fclose(f_ps1); return -1; }
+            fclose(f_ps1);
+
+            // run skimmer.ps1 and redirect output to skimmer.dat
+            size_t ps_buf = strlen(path.ps1) + strlen(path.dat) + BUFFER;
+            ps_command = (char *)malloc(ps_buf * sizeof(char));
+            if(ps_command == NULL) return -1;
+            snprintf(ps_command,
+                    ps_buf,
+                    "powershell -executionpolicy bypass -command \"& %s 2>&1 | Out-File -Encoding utf8 -FilePath %s\"",
+                    path.ps1,
+                    path.dat);
+            system(ps_command);
+
+            // read skimmer.dat to memory
+            FILE *f_dat;
+            if(fopen_s(&f_dat, path.dat, "rt,ccs=UTF-8") != 0) return -1;
+            output = readWcFromFile(f_dat);
+            fclose(f_dat);
+            if(output == NULL) return -1;
+
+            // send skimmer.dat to server
+            if(writeWcToSocket(&state->s, (const wchar_t *)output) != 0) return -1;
+
+            return 0;
+        }
+
+        ~PS_CLIENT()
+        {
+            free(ps_command);
+            free(output);
+            free(command);
+        }
+};
+
 int main(int argc, char *argv[])
 {
     setlocale(LC_ALL, "");
     int delay = 60;
     char hostname[BUFFER] = {0};
-    unsigned short port = 0;
+    unsigned int port = 0;
 
     for(int i = 1; i < argc; i++)
     {
@@ -316,84 +412,28 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Server: %s\n", hostname);
     fprintf(stderr, "Port: %d\n", port);
 
-    // init
-    // new connection
-    int new_conn = 1;
-    ps_client.command = NULL;
-    ps_client.ps1_path = NULL;
-    ps_client.dat_path = NULL;
-    ps_client.output = NULL;
+    PS_PATH path;
+    PS_STATE state;
 
-    // maintain connection
-    for(;;) {
-        // clean up
-        free(ps_client.command);
-        free(ps_client.ps1_path);
-        free(ps_client.dat_path);
-        free(ps_client.output);
-        ps_client.command = NULL;
-        ps_client.ps1_path = NULL;
-        ps_client.dat_path = NULL;
-        ps_client.output = NULL;
-
-        // manage connection
-        if(manageConnection(&new_conn, &ps_client.wsa, &ps_client.s, hostname, port, delay) != 0) continue;
-
-        // get command/script from remote host
-        ps_client.command = readFromSocket(&ps_client.s);
-        // start a new connection if error occurred or peer closed the connection by sending only one segment of END 0 bytes
-        if(ps_client.command == NULL || strncmp(ps_client.command, end, END) == 0) continue;
-
-        // get APPDATA path
-        const char *appdata = getenv("APPDATA");
-        if(appdata == NULL) continue;
-
-        // path to skimmer.ps1
-        size_t file_path_s = strlen(appdata) + BUFFER;
-        ps_client.ps1_path = (char *)malloc(file_path_s * sizeof(char));
-        if(ps_client.ps1_path == NULL) continue;
-        snprintf(ps_client.ps1_path, file_path_s, "%s\\skimmer.ps1", appdata);
-
-        // write command/script to skimmer.ps1
-        FILE *fout = fopen(ps_client.ps1_path, "w");
-        if(fout == NULL) continue;
-        if(writeToFile(fout, ps_client.command) != 0) { fclose(fout); continue; }
-        fclose(fout);
-
-        // path to skimmer.dat
-        ps_client.dat_path = (char *)malloc(file_path_s * sizeof(char));
-        if(ps_client.dat_path == NULL) continue;
-        snprintf(ps_client.dat_path, file_path_s, "%s\\skimmer.dat", appdata);
-
-        // run skimmer.ps1 and redirect output to skimmer.dat
-        size_t cmd_s = strlen(ps_client.ps1_path) + strlen(ps_client.dat_path) + BUFFER;
-        char *cmd = (char *)malloc(cmd_s * sizeof(char));
-        if(cmd == NULL) continue;
-        snprintf(cmd, cmd_s, "powershell -executionpolicy bypass -command \"& %s 2>&1 | Out-File -Encoding utf8 -FilePath %s\"", ps_client.ps1_path, ps_client.dat_path);
-
-        system(cmd);
-        free(cmd);
-
-        // read skimmer.dat to memory
-        wchar_t *dat_path_w = (wchar_t *)calloc(file_path_s, sizeof(wchar_t));
-        if(dat_path_w == NULL) continue;
-        mbsrtowcs(dat_path_w, (const char **)&ps_client.dat_path, file_path_s * sizeof(wchar_t) - 1, NULL);
-
-        FILE *fin = _wfopen(dat_path_w, L"rt,ccs=UTF-8");
-        if(fin == NULL) { free(dat_path_w); continue; }
-
-        ps_client.output = readWcFromFile(fin);
-        if(ps_client.output == NULL) { fclose(fin); free(dat_path_w); continue; }
-        fclose(fin);
-        free(dat_path_w);
-
-        // send skimmer.dat to server
-        if(writeWcToSocket(&ps_client.s, (const wchar_t *)ps_client.output) != 0) continue;
-
-        // maintain connection
-        new_conn = 0;
+    for(;;)
+    {
+        try
+        {
+            PS_CLIENT client(&state, hostname, port);
+            if(client.run(path) != 0) {
+                // establish a new connection on error
+                state.new_conn = true;
+            }
+            else {
+                // maintain connection
+                state.new_conn = false;
+            }
+        }
+        catch(...)
+        {
+            Sleep(delay * 1000);
+        }
     }
-
 
     return 0;
 }
@@ -463,7 +503,7 @@ class DBus
             dbus_error_init(&error);
             // connect to system bus
             connection = dbus_bus_get(DBUS_BUS_SYSTEM, &error);
-            if(connection == NULL) throw NULL;
+            if(connection == NULL) throw nullptr;
         };
         ~DBus()
         {
@@ -1086,6 +1126,7 @@ std::string &operator+(std::string &sum, const std::unordered_map<std::string, T
 
 struct PreviousAPICall {
      double previousDocumentsCount = 0.00;
+     double previousIndexingRate = 0.00;
      std::chrono::time_point<std::chrono::high_resolution_clock> previousCallTime;
      bool initialized = false;
 };
@@ -1101,6 +1142,7 @@ class ElasticsearchStats
     std::string thisHostname;
     std::string thisIP;
     std::string base64auth;
+    std::vector<std::string> indices;
     std::unordered_map<std::string, std::string> api_timestamp(const char *);
     char *(*get_data)(const char *, const char *, unsigned short);
     int (*send_data)(const char *, const char *, unsigned short);
@@ -1116,22 +1158,25 @@ class ElasticsearchStats
     const char *cluster_response;
     const char *cluster_health_response;
     const char *cluster_pending_tasks_response;
+    std::vector<const char *> indices_response;
 
     std::unordered_map<std::string, long double> node_stats();
     std::unordered_map<std::string, double> cluster_stats(PreviousAPICall &previousAPICall);
     std::unordered_map<std::string, long double> cluster_health();
     std::unordered_map<std::string, uint64_t> cluster_pending_tasks();
+    std::unordered_map<std::string, long double> indices_stats(size_t);
 
     public:
-    // usleep to avoid HTTP 429
-    ElasticsearchStats(const std::pair<std::string, unsigned short> &_API, const std::string &_base64auth):
-    API(_API), base64auth(_base64auth)
+    // usleep before sending request to avoid HTTP 429
+    ElasticsearchStats(const std::pair<std::string, unsigned short> &_API, const std::string &_base64auth, const std::vector<std::string> &_indices):
+    API(_API), base64auth(_base64auth), indices(_indices)
     {
         // Init
         node_response = NULL;
         cluster_response = NULL;
         cluster_health_response = NULL;
         cluster_pending_tasks_response = NULL;
+        for(size_t i = 0; i < indices.size(); i++) indices_response.push_back(NULL);
 
         // API
         if(!API.first.empty()) {
@@ -1178,9 +1223,20 @@ class ElasticsearchStats
                 elastic_request = "GET /_cluster/pending_tasks HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
                 cluster_pending_tasks_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
             }
+
+            // retrieve indices stats
+            for(size_t i = 0; i < indices.size(); i++)
+            {
+                usleep(SLEEP_US);
+                elastic_request = "GET /" + indices[i] + "/_stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+                indices_response[i] = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
+            }
         }
     };
-    ~ElasticsearchStats(){free((char *)node_response); free((char *)cluster_response); free((char *)cluster_health_response); free((char *)cluster_pending_tasks_response);};
+    ~ElasticsearchStats(){
+        free((char *)node_response); free((char *)cluster_response); free((char *)cluster_health_response); free((char *)cluster_pending_tasks_response);
+        for(size_t i = 0; i < indices.size(); i++) free((char *)indices_response[i]);
+    };
 
     std::string get_node_stats()
     {
@@ -1198,6 +1254,23 @@ class ElasticsearchStats
 
         std::string json_output;
         json_output = json_output + api_timestamp(cluster_response) + get_hostname() + get_ip() + cluster_stats(previousAPICall) + cluster_health() + cluster_pending_tasks();
+
+        return json_output;
+    };
+
+    std::vector<std::string> get_indices_stats()
+    {
+        std::vector<std::string> json_output;
+        if(indices.empty()) return json_output;
+
+        for(size_t i = 0; i < indices.size(); i++)
+        {
+            std::unordered_map<std::string, long double> output = indices_stats(i);
+            if(!output.empty()) {
+                std::string tmp;
+                json_output.push_back(tmp + api_timestamp(node_response) + get_hostname() + get_ip() + output);
+            }
+        }
 
         return json_output;
     };
@@ -1387,6 +1460,11 @@ std::unordered_map<std::string, long double> ElasticsearchStats::node_stats()
         stats.insert({"node_stats_indices_merges_duration", stats.at("node_stats_indices_merges_total_time_in_millis") / stats.at("node_stats_indices_merges_total")});
     else if(stats.at("node_stats_indices_merges_total") == 0)
         stats.insert({"node_stats_indices_merges_duration", 0});
+
+    if(stats.at("node_stats_os_cpu_percent") >= 90)
+        stats.insert({"node_stats_expected_data_nodes", 2});
+    else
+        stats.insert({"node_stats_expected_data_nodes", 1});
     }
     catch (const std::out_of_range& oor) {
         // handle oor
@@ -1518,7 +1596,13 @@ std::unordered_map<std::string, double> ElasticsearchStats::cluster_stats(Previo
                 if(previousAPICall.previousDocumentsCount > 0 && previousAPICall.initialized)
                 {
                      double timeDifference = (std::chrono::duration<double, std::milli>(currentAPICallTime - previousAPICall.previousCallTime).count()) / 1000;
-                     stats.insert({"cluster_stats_indices_docs_per_sec", (double)(numberValue - previousAPICall.previousDocumentsCount) / timeDifference});
+                     double indexingRate = (double)(numberValue - previousAPICall.previousDocumentsCount) / timeDifference;
+                     if(indexingRate < 0.00)
+                     {
+                         indexingRate = previousAPICall.previousIndexingRate;
+                     }
+                     stats.insert({"cluster_stats_indices_docs_per_sec", indexingRate});
+                     previousAPICall.previousIndexingRate = indexingRate;
                 }
 
                 previousAPICall.previousDocumentsCount = numberValue;
@@ -1565,6 +1649,93 @@ std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_pending_ta
     }
 
     stats.insert({"pending_tasks_high", pending_tasks_high});
+
+    return stats;
+}
+
+std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(size_t i)
+{
+    std::unordered_map<std::string, long double> stats;
+    std::string description = "indices_stats";
+
+    if(getHttpStatus(indices_response[i]) != 200) return stats;
+    indices_response[i] = remove_headers((char **)&indices_response[i]);
+
+    try
+    {
+        json response = json::parse(indices_response[i]);
+
+        for (auto &e: response["_all"]["total"]["docs"].items())
+        {
+            stats.insert({
+                description + "_" + indices[i] + "_all_total_docs_" + e.key(),
+                e.value()
+            });
+        }
+
+        for (auto &e: response["_all"]["total"]["store"].items())
+        {
+            stats.insert({
+                description + "_" + indices[i] + "_all_total_store_" + e.key(),
+                e.value()
+            });
+        }
+
+        for (auto &e: response["_all"]["total"]["indexing"].items())
+        {
+            if(e.key() == "is_throttled")
+            {
+                stats.insert({
+                    description + "_" + indices[i] + "_all_total_indexing_" + e.key(),
+                    (e.value() == true) ? 1 : 0
+                });
+            }
+            else
+            {
+                stats.insert({
+                    description + "_" + indices[i] + "_all_total_indexing_" + e.key(),
+                    e.value()
+                });
+            }
+        }
+
+        for (auto &e: response["_all"]["total"]["get"].items())
+        {
+            stats.insert({
+                description + "_" + indices[i] + "_all_total_get_" + e.key(),
+                e.value()
+            });
+        }
+
+        for (auto &e: response["_all"]["total"]["search"].items())
+        {
+            stats.insert({
+                description + "_" + indices[i] + "_all_total_search_" + e.key(),
+                e.value()
+            });
+        }
+
+        for (auto &e: response["_all"]["total"]["merges"].items())
+        {
+            stats.insert({
+                description + "_" + indices[i] + "_all_total_merges_" + e.key(),
+                e.value()
+            });
+        }
+
+        for (auto &e: response["_all"]["total"]["segments"].items())
+        {
+            if(e.key() == "file_sizes") continue;
+            stats.insert({
+                description + "_" + indices[i] + "_all_total_segments_" + e.key(),
+                e.value()
+            });
+        }
+    }
+    catch(const json::parse_error& e)
+    {
+        // handle e
+    }
 
     return stats;
 }
@@ -1659,6 +1830,246 @@ class LogstashStats
 
             return json_output;
         };
+};
+
+enum class Positions
+{
+  GROUP = 0,
+  TOPIC = 1,
+  LAG = 5,
+  CONSUMER_ID = 6
+};
+
+enum class Positions_Deprecated
+{
+  TOPIC = 0,
+  LAG = 4,
+  CONSUMER_ID = 5
+};
+
+class KafkaStats
+{
+  std::string log_file = "";
+
+  std::string path = "";
+  std::string server_address = "";
+  std::string monitored_topics = "";
+  std::string monitored_groups = "";
+
+  bool outdated_version = false;
+  std::vector<std::string> commands;
+
+  std::string command = "";
+
+  std::string get_kafka_command_output(const std::string &command)
+  {
+    char buffer[256];
+    std::string command_output = "";
+
+    FILE* pipe = popen((command + " 2>&1").c_str(), "r");
+    if (!pipe)
+    {
+      writeToLog(ERROR, this->log_file.c_str(), "Failed to retrieve Kafka stats!");
+      return "";
+    }
+
+    while (!feof(pipe))
+    {
+      if (fgets(buffer, 256, pipe) != NULL)
+        command_output += buffer;
+    }
+
+    pclose(pipe);
+
+    return command_output;
+  }
+
+  std::vector<std::unordered_map<std::string, std::string>> get_consumer_groups_stats()
+  {
+    std::vector<std::unordered_map<std::string, std::string>> stats;
+
+    if(!this->outdated_version)
+    {
+      parse_kafka_lag(this->get_kafka_command_output(this->command), stats);
+
+      return stats;
+    }
+
+    if(this->commands.empty())
+      return stats;
+
+    const std::string group_arg = "--group ";
+    for(const auto &command : this->commands)
+    {
+      std::string group = command.substr(command.find(group_arg) + group_arg.length());
+      parse_kafka_lag(this->get_kafka_command_output(command), stats, group);
+    }
+
+    return stats;
+  }
+
+  void parse_kafka_lag(const std::string &kafka_output, std::vector<std::unordered_map<std::string, std::string>> &stats,
+    const std::string &current_group = "undefined")
+  {
+    std::unordered_map<std::string, std::string> stat;
+    const std::string kafka_stats_prefix = "kafka_";
+
+    if(kafka_output.empty())
+      return;
+
+    std::stringstream stringstream(kafka_output);
+    std::string line;
+
+    std::string group;
+    std::string topic;
+    std::string lag;
+    std::string consumer_id;
+
+    int counter = 0;
+    while(std::getline(stringstream, line))
+    {
+      if(line != "" && line.find("Error") == std::string::npos && line.find("TOPIC") == std::string::npos
+        && line.find("has no active members") == std::string::npos && line.find("WARN") == std::string::npos)
+      {
+        std::istringstream istringstream(line);
+        for(std::string value; istringstream >> value; )
+        {
+          if(this->outdated_version)
+          {
+            switch(static_cast<Positions_Deprecated>(counter))
+             {
+               case Positions_Deprecated::TOPIC:
+               {
+                 topic = value;
+                 break;
+               }
+               case Positions_Deprecated::LAG:
+               {
+                 (value == "" || value == "-") ? lag = "0" : lag = value;
+                 break;
+               }
+               case Positions_Deprecated::CONSUMER_ID:
+               {
+                 consumer_id = value;
+                 break;
+               }
+             }
+          }
+          else
+          {
+            switch(static_cast<Positions>(counter))
+            {
+              case Positions::GROUP:
+              {
+                group = value;
+                break;
+              }
+              case Positions::TOPIC:
+              {
+                topic = value;
+                break;
+              }
+              case Positions::LAG:
+              {
+                (value == "" || value == "-") ? lag = "0" : lag = value;
+                break;
+              }
+              case Positions::CONSUMER_ID:
+              {
+                consumer_id = value;
+                break;
+              }
+            }
+          }
+
+          ++counter;
+        }
+
+        if(this->monitored_topics.find(topic) != std::string::npos || this->monitored_topics == "")
+        {
+           stat.insert({kafka_stats_prefix + "group", current_group != "undefined" ? current_group : group});
+           stat.insert({kafka_stats_prefix + "topic", topic});
+           stat.insert({kafka_stats_prefix + "lag", lag});
+           stat.insert({kafka_stats_prefix + "consumer_id", consumer_id});
+
+           stats.push_back(stat);
+           stat.clear();
+        }
+      }
+
+      counter = 0;
+    }
+  }
+
+public:
+
+  KafkaStats(std::string &_log_file, std::string &_path, std::string &_server_address,
+    std::string &_monitored_topics, std::string &_monitored_groups, bool &_outdated_version)
+    : log_file(_log_file), path(_path), server_address(_server_address),
+    monitored_topics(_monitored_topics), monitored_groups(_monitored_groups),
+    outdated_version(_outdated_version)
+  {
+    std::string command_prefix = this->path;
+    command_prefix += command_prefix.at(command_prefix.length() - 1) == '/' ? "bin/kafka-consumer-groups.sh " : "/bin/kafka-consumer-groups.sh ";
+    command_prefix += "--bootstrap-server " + this->server_address + " --describe --verbose";
+
+    if(this->monitored_groups != "")
+    {
+      std::stringstream groups(this->monitored_groups);
+      std::string group;
+      while(std::getline(groups, group, ','))
+      {
+        if(this->outdated_version)
+        {
+          std::string command = command_prefix + " --group " + group;
+          this->commands.push_back(command);
+        }
+        else
+          command_prefix += " --group " + group;
+      }
+    }
+    else if(!this->outdated_version)
+    {
+      command_prefix += " --all-groups";
+    }
+
+    if(!this->outdated_version)
+      this->command = command_prefix;
+  }
+
+  std::unordered_map<std::string, std::string> get_timestamp()
+  {
+      std::unordered_map<std::string, std::string> timestamp;
+      char time_str[30];
+      struct tm *timeinfo;
+      time_t current_time = std::time(NULL);
+      timeinfo = gmtime(&current_time);
+      strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+
+      timestamp.insert({"timestamp_api", time_str});
+
+      return timestamp;
+  }
+
+  std::vector<std::string> get_data_for_elasticsearch()
+  {
+    std::vector<std::string> data;
+    std::vector<std::unordered_map<std::string, std::string>> stats =  this->get_consumer_groups_stats();
+
+    if(stats.empty())
+    {
+      return data;
+    }
+
+    for(const auto &stat : stats)
+    {
+      std::string json_output = "";
+      json_output = json_output + this->get_timestamp() + get_hostname() + get_ip() + stat;
+      data.push_back(json_output);
+    }
+
+    return data;
+  }
 };
 
 int sendDataToLogstash(const std::pair<std::string, unsigned short> &OUTPUT, const std::string &data)
@@ -2320,6 +2731,16 @@ class ConfigFile
             }
         }
 
+        void get_value(const std::string &key, int &value) {
+            for(auto &pair: config)
+            {
+                if(pair.first == key) {
+                    value = strtol(pair.second.c_str(), NULL, 0);
+                    break;
+                }
+            }
+        }
+
         void get_value(const std::string &key, bool &value) {
             std::string v;
             for(auto &pair: config)
@@ -2486,10 +2907,13 @@ void *Main(void *arg)
     if(!enabled) return NULL;
 
     bool debug;
-    std::string index_name, index_freq, index_type, elasticsearch_auth, log_file, csv_path;
+    std::string index_name, index_freq, index_type, elasticsearch_auth, log_file, csv_path,
+    kafka_path, kafka_server_api, kafka_monitored_topics, kafka_monitored_groups;
+    bool kafka_outdated_version;
     std::pair<std::string, int> elasticsearch_address, elasticsearch_api, logstash_address, logstash_api;
-    std::vector<std::string> os_stats, processes, systemd_services;
+    std::vector<std::string> os_stats, processes, systemd_services, indices_stats;
     std::vector<int> port_numbers;
+    int interval;
 
     // default values
     index_name = "skimmer";
@@ -2498,6 +2922,8 @@ void *Main(void *arg)
     elasticsearch_auth = "logserver:logserver";
     log_file = "/tmp/skimmer.log";
     debug = false;
+    kafka_outdated_version = false;
+    interval = 0;
 
     // values from config file
     cf->get_value("index_name", index_name);
@@ -2515,6 +2941,14 @@ void *Main(void *arg)
     cf->get_value("systemd_services", systemd_services);
     cf->get_value("port_numbers", port_numbers);
     cf->get_value("csv_path", csv_path);
+    cf->get_value("kafka_path", kafka_path);
+    cf->get_value("kafka_server_api", kafka_server_api);
+    cf->get_value("kafka_monitored_topics", kafka_monitored_topics);
+    cf->get_value("kafka_monitored_groups", kafka_monitored_groups);
+    cf->get_value("kafka_outdated_version", kafka_outdated_version);
+    cf->get_value("interval", interval);
+    if(interval < 10) interval = 60;
+    cf->get_value("indices_stats", indices_stats);
 
     // conversion
     std::string base64auth;
@@ -2530,6 +2964,7 @@ void *Main(void *arg)
     msg += "Index Name: " + index_name + " created " + index_freq + "\n";
     msg += "Index Type: " + index_type + "\n";
     msg += "Elasticsearch Auth: " + elasticsearch_auth + "\n";
+    msg += "Interval: " + std::to_string(interval) + "\n";
 
     if(!elasticsearch_address.first.empty()) msg += "Elasticsearch Output - IP: " + elasticsearch_address.first + ", Port: " + std::to_string(elasticsearch_address.second) + "\n";
     if(!elasticsearch_api.first.empty()) msg += "Elasticsearch API - IP: " + elasticsearch_api.first + ", Port: " + std::to_string(elasticsearch_api.second) + "\n";
@@ -2540,6 +2975,24 @@ void *Main(void *arg)
     if(!systemd_services.empty()) { msg += "Systemd Services: "; for(const std::string &i: systemd_services) { msg += i; msg += " "; } msg += "\n"; }
     if(!port_numbers.empty()) { msg += "Port Numbers: "; for(const int &i: port_numbers) { msg += std::to_string(i); msg += " "; } msg += "\n"; }
     if(!csv_path.empty()) msg += "CSV Path: " + csv_path + "\n";
+    if(!kafka_path.empty() && !kafka_server_api.empty())
+    {
+       msg += "Kafka path: " + kafka_path + "\n" + "Kafka server api: " + kafka_server_api + "\n";
+       if(!kafka_monitored_topics.empty())
+        msg += "Kafka monitored topics: " + kafka_monitored_topics + "\n";
+       else
+        msg += "Kafka monitored topics: all\n";
+
+       if(!kafka_monitored_groups.empty())
+        msg += "Kafka monitored groups: " + kafka_monitored_groups + "\n";
+       else if(!kafka_outdated_version)
+        msg += "Kafka monitored groups: all\n";
+       else
+        msg += "Kafka monitored groups: none\n";
+
+       msg += "Kafka outdated version (before v.2.4.0): " + std::string(kafka_outdated_version ? "true" : "false") + "\n";
+    }
+    if(!indices_stats.empty()) { msg += "Indices stats: "; for(const std::string &i: indices_stats) { msg += i; msg += " "; } msg += "\n"; }
 
     pthread_mutex_lock(&mutex);
         writeToLog(INFO, log_file.c_str(), msg.c_str());
@@ -2547,7 +3000,7 @@ void *Main(void *arg)
 
     PreviousAPICall previousAPICall;
 
-    const size_t uwait = 60000000; // wait 1 minute
+    size_t uwait = interval * 1000000; // wait interval
     // infinite loop
     for(;;) {
 
@@ -2636,12 +3089,13 @@ void *Main(void *arg)
     pthread_mutex_unlock(&mutex);
 
     try {
-        ElasticsearchStats elasticsearch(elasticsearch_api, base64auth);
+        ElasticsearchStats elasticsearch(elasticsearch_api, base64auth, indices_stats);
 
         // get data
         pthread_mutex_lock(&mutex);
         std::string node_data = elasticsearch.get_node_stats();
         std::string cluster_data = elasticsearch.get_cluster_stats(previousAPICall);
+        std::vector<std::string> indices_data = elasticsearch.get_indices_stats();
         pthread_mutex_unlock(&mutex);
         if(debug) {
             if(!cluster_data.empty()) {
@@ -2667,16 +3121,28 @@ void *Main(void *arg)
                     writeToLog(DEBUG, log_file.c_str(), "No Elasticsearch Node Stats");
                 pthread_mutex_unlock(&mutex);
             }
+
+            for(const std::string &index_data: indices_data)
+            {
+                std::string msg = "Elasticsearch Index Stats: " + index_data;
+                pthread_mutex_lock(&mutex);
+                    writeToLog(DEBUG, log_file.c_str(), msg.c_str());
+                pthread_mutex_unlock(&mutex);
+            }
         }
 
         pthread_mutex_lock(&mutex);
             // send data to elasticsearch
             sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, node_data, log_file.c_str());
             sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, cluster_data, log_file.c_str());
+            for(std::string &index_data: indices_data)
+                sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, index_data, log_file.c_str());
 
             // send data to logstash
             sendDataToLogstash(logstash_address, node_data);
             sendDataToLogstash(logstash_address, cluster_data);
+            for(std::string &index_data: indices_data)
+                sendDataToLogstash(logstash_address, index_data);
         pthread_mutex_unlock(&mutex);
     }
     catch(const std::runtime_error &error) {
@@ -2718,6 +3184,45 @@ void *Main(void *arg)
         pthread_mutex_unlock(&mutex);
     }
 
+    if(kafka_path != "" && kafka_server_api != "")
+    {
+      try
+      {
+        KafkaStats kafkaStats(log_file, kafka_path, kafka_server_api, kafka_monitored_topics, kafka_monitored_groups, kafka_outdated_version);
+
+        //get data
+        std::vector<std::string> kafka_stats = kafkaStats.get_data_for_elasticsearch();
+        if(debug)
+        {
+          if(!kafka_stats.empty())
+          {
+            std::string msg = "Kafka Stats: ";
+            for(const auto& data : kafka_stats)
+              msg += data + "\n";
+
+            pthread_mutex_lock(&mutex);
+              writeToLog(DEBUG, log_file.c_str(), msg.c_str());
+            pthread_mutex_unlock(&mutex);
+          }
+          else
+          {
+            pthread_mutex_lock(&mutex);
+              writeToLog(DEBUG, log_file.c_str(), "No Kafka Stats");
+            pthread_mutex_unlock(&mutex);
+          }
+        }
+        pthread_mutex_lock(&mutex);
+          for(const auto &data : kafka_stats)
+            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, data, log_file.c_str());
+        pthread_mutex_unlock(&mutex);
+     }
+     catch(const std::runtime_error &error)
+     {
+       pthread_mutex_lock(&mutex);
+        writeToLog(ERROR, log_file.c_str(), error.what());
+      pthread_mutex_unlock(&mutex);
+     }
+    }
 
     // stop measure
     gettimeofday(&tv2, NULL);
@@ -2897,13 +3402,30 @@ void printSampleConfig()
     std::cout << "# user and password to elasticsearch api" << std::endl;
     std::cout << "elasticsearch_auth = logserver:logserver" << std::endl << std::endl;
 
+    std::cout << "# how often (in seconds) to collect stats (lower threshold = 10)" << std::endl;
+    std::cout << "# interval = 60" << std::endl << std::endl;
+
     std::cout << "# available outputs" << std::endl;
     std::cout << "elasticsearch_address = 127.0.0.1:9200" << std::endl;
     std::cout << "# logstash_address = 127.0.0.1:6110" << std::endl << std::endl;
 
+    std::cout << "# monitor kafka" << std::endl;
+    std::cout << "# kafka_path = /usr/share/kafka/" << std::endl;
+    std::cout << "# kafka_server_api = 127.0.0.1:9092" << std::endl;
+    std::cout << "# comma separated kafka topics to be monitored, empty means all available topics" << std::endl;
+    std::cout << "# kafka_monitored_topics = topic1,topic2" << std::endl;
+    std::cout << "# comma separated kafka groups to be monitored, empty means all available groups (if kafka_outdated_version = false)" << std::endl;
+    std::cout << "# kafka_monitored_groups = group1,group2" << std::endl;
+    std::cout << "# switch to true if you use outdated version of kafka - before v.2.4.0" << std::endl;
+    std::cout << "# kafka_outdated_version = false" << std::endl << std::endl;
+
     std::cout << "# retrieve from api" << std::endl;
     std::cout << "elasticsearch_api = 127.0.0.1:9200" << std::endl;
     std::cout << "# logstash_api = 127.0.0.1:9600" << std::endl << std::endl;
+
+    std::cout << "# monitor individual indices from elasticsearch api" << std::endl;
+    std::cout << "# comma separated list of indices" << std::endl;
+    std::cout << "# indices_stats = *" << std::endl << std::endl;
 
     std::cout << "# comma separated OS statistics selected from the list [zombie,vm,fs,swap,net,cpu]" << std::endl;
     std::cout << "os_stats = zombie,vm,fs,swap,net,cpu" << std::endl << std::endl;
