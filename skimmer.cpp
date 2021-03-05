@@ -34,6 +34,7 @@
  * 1.0.15 - added interval option, indices stats monitoring and nlohmann/json library
  * 1.0.15a- indices stats monitoring broken up into multiple documents
  * 1.0.16 - fixes in indices stats monitoring
+ * 1.0.17 - added _cat/tasks monitoring, _cat/shards monitoring with its own interval option: system_health_check_interval, improved performance, time units in config and other changes
 */
 #include <iostream>
 #include <cstdio>
@@ -86,9 +87,8 @@ using json = nlohmann::json;
 #define BUFFER      1024
 #define MIN_PORT    1
 #define MAX_PORT    65535
-#define SLEEP_US    100000
 #define MODULES     2
-#define VERSION     "1.0.16"
+#define VERSION     "1.0.17"
 
 // PSexec module
 // marks end of connection
@@ -637,10 +637,10 @@ const char *remove_headers(char **response)
 {
 	const char *content = *response;
 	char *tmp_ptr = NULL;
-	while(strstr(content, "\r\n\r\n") != NULL)
-	{
-		content += 4;
-	}
+	while(strstr(content, "\r\n\r\n") != NULL) content += 4;
+	// remove empty lines
+	const char *s = NULL;
+	while((s = strpbrk(content, "\r\n")) != NULL && s == content) content += 1;
 	tmp_ptr = (char *)calloc(strlen(content) + 1, sizeof(char));
 	strncpy(tmp_ptr, content, strlen(content));
 
@@ -933,31 +933,33 @@ const char *extract_json_value(const char *response, const char **json_key)
 
 int writeToLog(LOG_LEVEL level, const char *filename, const char *message)
 {
-        FILE *logFile = fopen(filename, "a");
-        if(logFile == NULL){fprintf(stderr, "cannot open log file\n");return -1;}
-        struct tm *timeinfo;
-        time_t rawtime = time(NULL);
+    pthread_mutex_lock(&mutex);
+    FILE *logFile = fopen(filename, "a");
+    if(logFile == NULL){fprintf(stderr, "cannot open log file\n"); pthread_mutex_unlock(&mutex); return -1;}
+    struct tm *timeinfo;
+    time_t rawtime = time(NULL);
 
-        // stores time information
-        char time_buffer[20];
+    // stores time information
+    char time_buffer[20];
 
-        timeinfo = localtime(&rawtime);
-        strftime(time_buffer, sizeof(time_buffer), "%d-%m-%Y %H:%M:%S", timeinfo);
-        switch (level)
-        {
-            case INFO:
-                fprintf(logFile, "[INFO] %s: %s\n", time_buffer, message);
-                break;
-            case DEBUG:
-                fprintf(logFile, "[DEBUG] %s: %s\n", time_buffer, message);
-                break;
-            case ERROR:
-                fprintf(logFile, "[ERROR] %s: %s\n", time_buffer, message);
-                break;
-        }
+    timeinfo = localtime(&rawtime);
+    strftime(time_buffer, sizeof(time_buffer), "%d-%m-%Y %H:%M:%S", timeinfo);
+    switch (level)
+    {
+        case INFO:
+            fprintf(logFile, "[INFO] %s: %s\n", time_buffer, message);
+            break;
+        case DEBUG:
+            fprintf(logFile, "[DEBUG] %s: %s\n", time_buffer, message);
+            break;
+        case ERROR:
+            fprintf(logFile, "[ERROR] %s: %s\n", time_buffer, message);
+            break;
+    }
 
-        fclose(logFile);
-        return 0;
+    fclose(logFile);
+    pthread_mutex_unlock(&mutex);
+    return 0;
 }
 
 template<typename T>
@@ -1159,16 +1161,19 @@ class ElasticsearchStats
     const char *cluster_response;
     const char *cluster_health_response;
     const char *cluster_pending_tasks_response;
+    const char *cluster_tasks_response;
+    const char *cluster_shards_response;
     std::vector<const char *> indices_response;
 
     std::unordered_map<std::string, long double> node_stats();
     std::unordered_map<std::string, double> cluster_stats(PreviousAPICall &previousAPICall);
     std::unordered_map<std::string, long double> cluster_health();
     std::unordered_map<std::string, uint64_t> cluster_pending_tasks();
+    void cluster_tasks(std::vector<std::string> &);
+    void cluster_shards(std::vector<std::string> &);
     std::unordered_map<std::string, long double> indices_stats(size_t);
 
     public:
-    // usleep before sending request to avoid HTTP 429
     ElasticsearchStats(const std::pair<std::string, unsigned short> &_API, const std::string &_base64auth, const std::vector<std::string> &_indices):
     API(_API), base64auth(_base64auth), indices(_indices)
     {
@@ -1177,6 +1182,8 @@ class ElasticsearchStats
         cluster_response = NULL;
         cluster_health_response = NULL;
         cluster_pending_tasks_response = NULL;
+        cluster_tasks_response = NULL;
+        cluster_shards_response = NULL;
         for(size_t i = 0; i < indices.size(); i++) indices_response.push_back(NULL);
 
         // API
@@ -1189,10 +1196,8 @@ class ElasticsearchStats
             else throw std::runtime_error("Failed to construct ElasticsearchStats object: Unable to communicate with cluster");
 
             // determine IP of all nodes in the cluster
-            usleep(SLEEP_US);
             if(nodes_ip() == -1) throw std::runtime_error("Failed to construct ElasticsearchStats object: Unable to determine nodes in the cluster");
             // determine master node IP
-            usleep(SLEEP_US);
             if(master_node_ip() == -1) throw std::runtime_error("Failed to construct ElasticsearchStats object: Unable to determine master node");
 
             // determine this IP
@@ -1208,34 +1213,33 @@ class ElasticsearchStats
             }
 
             // retrieve nodes stats
-            usleep(SLEEP_US);
             std::string elastic_request = "GET /_nodes/" + thisIP + "/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
             node_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
 
             // retrieve cluster stats
             if(thisIP == masterNodeIP) {
-                usleep(SLEEP_US);
                 elastic_request = "GET /_cluster/stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
                 cluster_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
-                usleep(SLEEP_US);
                 elastic_request = "GET /_cluster/health HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
-	            cluster_health_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
-                usleep(SLEEP_US);
+                cluster_health_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
                 elastic_request = "GET /_cluster/pending_tasks HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
                 cluster_pending_tasks_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
+                elastic_request = "GET /_cat/tasks?format=json HTTP/1.0\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+                cluster_tasks_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
+                elastic_request = "GET /_cat/shards?format=json HTTP/1.0\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
+                cluster_shards_response = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
             }
 
             // retrieve indices stats
             for(size_t i = 0; i < indices.size(); i++)
             {
-                usleep(SLEEP_US);
                 elastic_request = "GET /" + indices[i] + "/_stats HTTP/1.0\r\nContent-type: application/json\r\nAuthorization: Basic " + base64auth + "\r\n\r\n";
                 indices_response[i] = get_data(elastic_request.c_str(), API.first.c_str(), API.second);
             }
         }
     };
     ~ElasticsearchStats(){
-        free((char *)node_response); free((char *)cluster_response); free((char *)cluster_health_response); free((char *)cluster_pending_tasks_response);
+        free((char *)node_response); free((char *)cluster_response); free((char *)cluster_health_response); free((char *)cluster_pending_tasks_response); free((char *)cluster_tasks_response); free((char *)cluster_shards_response);
         for(size_t i = 0; i < indices.size(); i++) free((char *)indices_response[i]);
     };
 
@@ -1244,7 +1248,7 @@ class ElasticsearchStats
         if(node_response == NULL) return "";
 
         std::string json_output;
-        json_output = json_output + api_timestamp(node_response) + get_hostname() + get_ip() + node_stats();
+        json_output = json_output + api_timestamp(node_response) + node_stats();
 
         return json_output;
     };
@@ -1254,7 +1258,7 @@ class ElasticsearchStats
         if(cluster_response == NULL || cluster_health_response == NULL || cluster_pending_tasks_response == NULL) return "";
 
         std::string json_output;
-        json_output = json_output + api_timestamp(cluster_response) + get_hostname() + get_ip() + cluster_stats(previousAPICall) + cluster_health() + cluster_pending_tasks();
+        json_output = json_output + api_timestamp(cluster_response) + cluster_stats(previousAPICall) + cluster_health() + cluster_pending_tasks();
 
         return json_output;
     };
@@ -1270,12 +1274,46 @@ class ElasticsearchStats
             std::unordered_map<std::string, std::string> index = {{"index", indices[i]}};
             if(!output.empty()) {
                 std::string tmp;
-                json_output.push_back(tmp + api_timestamp(node_response) + get_hostname() + get_ip() + output + index);
+                json_output.push_back(tmp + api_timestamp(node_response) + output + index);
             }
         }
 
         return json_output;
     };
+
+    std::vector<std::string> get_cluster_tasks()
+    {
+        std::vector<std::string> json_output;
+        if(cluster_tasks_response == NULL) return json_output;
+
+        std::vector<std::string> cluster_tasks_output;
+        cluster_tasks(cluster_tasks_output);
+        for(std::string& output: cluster_tasks_output)
+        {
+            json_output.push_back(output);
+        }
+
+        return json_output;
+    }
+
+    std::vector<std::string> get_cluster_shards(const size_t interval, const size_t system_health_check_interval)
+    {
+        static size_t total = 0;
+        std::vector<std::string> json_output;
+
+        total += interval;
+        if(cluster_shards_response == NULL || total < system_health_check_interval) return json_output;
+        total = 0;
+
+        std::vector<std::string> cluster_shards_output;
+        cluster_shards(cluster_shards_output);
+        for(std::string& output: cluster_shards_output)
+        {
+            json_output.push_back(output);
+        }
+
+        return json_output;
+    }
 };
 
 int ElasticsearchStats::nodes_ip()
@@ -1655,6 +1693,32 @@ std::unordered_map<std::string, uint64_t> ElasticsearchStats::cluster_pending_ta
     return stats;
 }
 
+void ElasticsearchStats::cluster_tasks(std::vector<std::string> &stats)
+{
+    if(getHttpStatus(cluster_tasks_response) != 200) return;
+    cluster_tasks_response = remove_headers((char **)&cluster_tasks_response);
+
+    try
+    {
+        json response = json::parse(cluster_tasks_response);
+        for (const auto &e: response.items()) stats.push_back(e.value().dump());
+    }
+    catch(const json::parse_error& e) {}
+}
+
+void ElasticsearchStats::cluster_shards(std::vector<std::string> &stats)
+{
+    if(getHttpStatus(cluster_shards_response) != 200) return;
+    cluster_shards_response = remove_headers((char **)&cluster_shards_response);
+
+    try
+    {
+        json response = json::parse(cluster_shards_response);
+        for (const auto &e: response.items()) stats.push_back(e.value().dump());
+    }
+    catch(const json::parse_error& e) {}
+}
+
 std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(size_t i)
 {
     std::unordered_map<std::string, long double> stats;
@@ -1667,7 +1731,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(s
     {
         json response = json::parse(indices_response[i]);
 
-        for (auto &e: response["_all"]["total"]["docs"].items())
+        for (const auto &e: response["_all"]["total"]["docs"].items())
         {
             stats.insert({
                 description + "_all_total_docs_" + e.key(),
@@ -1675,7 +1739,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(s
             });
         }
 
-        for (auto &e: response["_all"]["total"]["store"].items())
+        for (const auto &e: response["_all"]["total"]["store"].items())
         {
             stats.insert({
                 description + "_all_total_store_" + e.key(),
@@ -1683,7 +1747,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(s
             });
         }
 
-        for (auto &e: response["_all"]["total"]["indexing"].items())
+        for (const auto &e: response["_all"]["total"]["indexing"].items())
         {
             if(e.key() == "is_throttled")
             {
@@ -1701,7 +1765,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(s
             }
         }
 
-        for (auto &e: response["_all"]["total"]["get"].items())
+        for (const auto &e: response["_all"]["total"]["get"].items())
         {
             stats.insert({
                 description + "_all_total_get_" + e.key(),
@@ -1709,7 +1773,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(s
             });
         }
 
-        for (auto &e: response["_all"]["total"]["search"].items())
+        for (const auto &e: response["_all"]["total"]["search"].items())
         {
             stats.insert({
                 description + "_all_total_search_" + e.key(),
@@ -1717,7 +1781,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(s
             });
         }
 
-        for (auto &e: response["_all"]["total"]["merges"].items())
+        for (const auto &e: response["_all"]["total"]["merges"].items())
         {
             stats.insert({
                 description + "_all_total_merges_" + e.key(),
@@ -1725,7 +1789,7 @@ std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(s
             });
         }
 
-        for (auto &e: response["_all"]["total"]["segments"].items())
+        for (const auto &e: response["_all"]["total"]["segments"].items())
         {
             if(e.key() == "file_sizes") continue;
             stats.insert({
@@ -1734,18 +1798,18 @@ std::unordered_map<std::string, long double> ElasticsearchStats::indices_stats(s
             });
         }
     }
-    catch(const json::parse_error& e)
-    {
-        // handle e
-    }
+    catch(const json::parse_error& e) {}
 
     return stats;
 }
 
-int sendDataToElasticsearch(bool debug, const std::pair<std::string, unsigned short> &OUTPUT, const std::string &index, const std::string &type, const std::string &base64auth, const std::string &data, const char *logfile)
+int sendDataToElasticsearch(bool debug, const std::pair<std::string, unsigned short> &OUTPUT, const std::string &index, const std::string &type, const std::string &base64auth, std::string &_data, const char *logfile)
 {
-    if(data.empty()) return -1;
+    if(_data.empty()) return -1;
     if(OUTPUT.first.empty()) return -1;
+    // update data
+    const std::string data = _data + get_hostname() + get_ip();
+
     // ISO8601 UTC timestamp
 	struct tm *timeinfo;
 	time_t rawtime = time(NULL);
@@ -1828,7 +1892,7 @@ class LogstashStats
             if(api_response == NULL) return "";
 
             std::string json_output;
-            json_output = json_output + get_hostname() + get_ip() + api_stats() + cpu_load();
+            json_output = json_output + api_stats() + cpu_load();
 
             return json_output;
         };
@@ -1886,9 +1950,9 @@ class KafkaStats
     return command_output;
   }
 
-  std::vector<std::unordered_map<std::string, std::string>> get_consumer_groups_stats()
+  std::vector<std::string> get_consumer_groups_stats()
   {
-    std::vector<std::unordered_map<std::string, std::string>> stats;
+    std::vector<std::string> stats;
 
     if(!this->outdated_version)
     {
@@ -1910,7 +1974,7 @@ class KafkaStats
     return stats;
   }
 
-  void parse_kafka_lag(const std::string &kafka_output, std::vector<std::unordered_map<std::string, std::string>> &stats,
+  void parse_kafka_lag(const std::string &kafka_output, std::vector<std::string> &stats,
     const std::string &current_group = "undefined")
   {
     std::unordered_map<std::string, std::string> stat;
@@ -1994,7 +2058,20 @@ class KafkaStats
            stat.insert({kafka_stats_prefix + "lag", lag});
            stat.insert({kafka_stats_prefix + "consumer_id", consumer_id});
 
-           stats.push_back(stat);
+           std::string json_s;
+           json_s << stat;
+
+           try
+           {
+               json json_r = json::parse(json_s);
+               json_r[kafka_stats_prefix + "consumer_id"] = strtol(json_r[kafka_stats_prefix + "consumer_id"].get<std::string>().c_str(), NULL, 0);
+               stats.push_back(json_r.dump());
+           }
+           catch(const json::parse_error& e)
+           {
+               stats.push_back(json_s);
+           }
+
            stat.clear();
         }
       }
@@ -2056,17 +2133,17 @@ public:
   std::vector<std::string> get_data_for_elasticsearch()
   {
     std::vector<std::string> data;
-    std::vector<std::unordered_map<std::string, std::string>> stats =  this->get_consumer_groups_stats();
+    std::vector<std::string> stats =  this->get_consumer_groups_stats();
 
     if(stats.empty())
     {
       return data;
     }
 
-    for(const auto &stat : stats)
+    for(auto &stat : stats)
     {
-      std::string json_output = "";
-      json_output = json_output + this->get_timestamp() + get_hostname() + get_ip() + stat;
+      std::string json_output;
+      json_output = stat + this->get_timestamp();
       data.push_back(json_output);
     }
 
@@ -2074,11 +2151,18 @@ public:
   }
 };
 
-int sendDataToLogstash(const std::pair<std::string, unsigned short> &OUTPUT, const std::string &data)
+int sendDataToLogstash(const std::pair<std::string, unsigned short> &OUTPUT, std::string &_data)
 {
-    if(data.empty()) return -1;
+    if(_data.empty()) return -1;
     if(OUTPUT.first.empty()) return -1;
+    const std::string data = _data + get_hostname() + get_ip();
     return sendData(data.c_str(), OUTPUT.first.c_str(), OUTPUT.second);
+}
+
+void sendDataToLogstash(const std::pair<std::string, unsigned short> &OUTPUT, std::string &&_data)
+{
+    std::string data = _data;
+    sendDataToLogstash(OUTPUT, data);
 }
 
 std::unordered_map<std::string, long double> LogstashStats::cpu_load()
@@ -2724,7 +2808,7 @@ class ConfigFile
         }
 
         void get_value(const std::string &key, std::string &value) {
-            for(auto &pair: config)
+            for(const auto &pair: config)
             {
                 if(pair.first == key) {
                     value = pair.second;
@@ -2734,7 +2818,7 @@ class ConfigFile
         }
 
         void get_value(const std::string &key, int &value) {
-            for(auto &pair: config)
+            for(const auto &pair: config)
             {
                 if(pair.first == key) {
                     value = strtol(pair.second.c_str(), NULL, 0);
@@ -2743,9 +2827,32 @@ class ConfigFile
             }
         }
 
+        int get_time_value(const std::string &key, size_t &value) {
+            for(const auto &pair: config)
+            {
+                if(pair.first == key) {
+                    char *endptr = NULL;
+                    size_t v = strtol(pair.second.c_str(), &endptr, 0);
+                    if(endptr == NULL) return -1;
+                    else
+                    {
+                        std::string s(endptr);
+                        trim(s);
+                        if(s == "s") value = v;
+                        else if(s == "m" || s == "min") value = v * 60;
+                        else if(s == "h") value = v * 60 * 60;
+                        else return -1;
+                    }
+                    break;
+                }
+            }
+
+            return 0;
+        }
+
         void get_value(const std::string &key, bool &value) {
             std::string v;
-            for(auto &pair: config)
+            for(const auto &pair: config)
             {
                 if(pair.first == key) {
                     v = pair.second;
@@ -2759,7 +2866,7 @@ class ConfigFile
 
         void get_value(const std::string &key, std::vector<std::string> &value) {
             std::string v;
-            for(auto &pair: config)
+            for(const auto &pair: config)
             {
                 if(pair.first == key) {
                     v = pair.second;
@@ -2779,7 +2886,7 @@ class ConfigFile
 
         void get_value(const std::string &key, std::vector<int> &value) {
             std::string v;
-            for(auto &pair: config)
+            for(const auto &pair: config)
             {
                 if(pair.first == key) {
                     v = pair.second;
@@ -2798,7 +2905,7 @@ class ConfigFile
 
         void get_value(const std::string &key, std::pair<std::string, int> &value) {
             std::string v;
-            for(auto &pair: config)
+            for(const auto &pair: config)
             {
                 if(pair.first == key) {
                     v = pair.second;
@@ -2916,7 +3023,7 @@ void *Main(void *arg)
     std::pair<std::string, int> elasticsearch_address, elasticsearch_api, logstash_address, logstash_api;
     std::vector<std::string> os_stats, processes, systemd_services, indices_stats;
     std::vector<int> port_numbers;
-    int interval;
+    size_t interval, system_health_check_interval;
 
     // default values
     index_name = "skimmer";
@@ -2927,6 +3034,7 @@ void *Main(void *arg)
     debug = false;
     kafka_outdated_version = false;
     interval = 0;
+    system_health_check_interval = 0;
 
     // values from config file
     cf->get_value("index_name", index_name);
@@ -2949,8 +3057,20 @@ void *Main(void *arg)
     cf->get_value("kafka_monitored_topics", kafka_monitored_topics);
     cf->get_value("kafka_monitored_groups", kafka_monitored_groups);
     cf->get_value("kafka_outdated_version", kafka_outdated_version);
-    cf->get_value("interval", interval);
+    if(cf->get_time_value("interval", interval) != 0)
+    {
+        writeToLog(ERROR, log_file.c_str(), "Failed to parse interval option. Main module not loaded");
+        return NULL;
+    }
     if(interval < 10) interval = 60;
+
+    if(cf->get_time_value("system_health_check_interval", system_health_check_interval) != 0)
+    {
+        writeToLog(ERROR, log_file.c_str(), "Failed to parse system_health_check_interval option. Main module not loaded");
+        return NULL;
+    }
+    if(system_health_check_interval < interval) system_health_check_interval = 4 * 60 * 60;
+
     cf->get_value("indices_stats", indices_stats);
 
     // conversion
@@ -2958,9 +3078,7 @@ void *Main(void *arg)
     base64Encode(elasticsearch_auth.c_str(), base64auth);
 
     // Module loaded
-    pthread_mutex_lock(&mutex);
-        writeToLog(INFO, log_file.c_str(), "Main module loaded");
-    pthread_mutex_unlock(&mutex);
+    writeToLog(INFO, log_file.c_str(), "Main module loaded");
 
     std::string msg;
     msg = "The following settings are used:\n";
@@ -2968,6 +3086,7 @@ void *Main(void *arg)
     msg += "Index Type: " + index_type + "\n";
     msg += "Elasticsearch Auth: " + elasticsearch_auth + "\n";
     msg += "Interval: " + std::to_string(interval) + "\n";
+    msg += "System Health Check Interval: " + std::to_string(system_health_check_interval) + "\n";
 
     if(!elasticsearch_address.first.empty()) msg += "Elasticsearch Output - IP: " + elasticsearch_address.first + ", Port: " + std::to_string(elasticsearch_address.second) + "\n";
     if(!elasticsearch_api.first.empty()) msg += "Elasticsearch API - IP: " + elasticsearch_api.first + ", Port: " + std::to_string(elasticsearch_api.second) + "\n";
@@ -2997,13 +3116,17 @@ void *Main(void *arg)
     }
     if(!indices_stats.empty()) { msg += "Indices stats: "; for(const std::string &i: indices_stats) { msg += i; msg += " "; } msg += "\n"; }
 
-    pthread_mutex_lock(&mutex);
-        writeToLog(INFO, log_file.c_str(), msg.c_str());
-    pthread_mutex_unlock(&mutex);
+    writeToLog(INFO, log_file.c_str(), msg.c_str());
 
     PreviousAPICall previousAPICall;
 
+    sigset_t sig;
+    sigemptyset(&sig);
+    sigaddset(&sig, SIGINT);
+    sigaddset(&sig, SIGTERM);
+
     size_t uwait = interval * 1000000; // wait interval
+
     // infinite loop
     for(;;) {
 
@@ -3020,7 +3143,6 @@ void *Main(void *arg)
 
     // Stats common for all nodes
     std::string stats_all;
-    stats_all = stats_all + get_hostname() + get_ip();
 
     for(const std::string &str: os_stats)
 	{
@@ -3081,77 +3203,84 @@ void *Main(void *arg)
 
     // send os stats
     if(debug) {
-        std::string msg = "OS Stats: " + stats_all;
-        pthread_mutex_lock(&mutex);
+        if(!stats_all.empty()) {
+            std::string msg = "OS Stats: " + stats_all;
             writeToLog(DEBUG, log_file.c_str(), msg.c_str());
-        pthread_mutex_unlock(&mutex);
+        }
+        else {
+            writeToLog(DEBUG, log_file.c_str(), "No OS Stats");
+        }
     }
-    pthread_mutex_lock(&mutex);
-        sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, stats_all, log_file.c_str());
-        sendDataToLogstash(logstash_address, stats_all);
-    pthread_mutex_unlock(&mutex);
+    sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, stats_all, log_file.c_str());
+    sendDataToLogstash(logstash_address, stats_all);
 
     try {
         ElasticsearchStats elasticsearch(elasticsearch_api, base64auth, indices_stats);
 
         // get data
-        pthread_mutex_lock(&mutex);
         std::string node_data = elasticsearch.get_node_stats();
         std::string cluster_data = elasticsearch.get_cluster_stats(previousAPICall);
         std::vector<std::string> indices_data = elasticsearch.get_indices_stats();
-        pthread_mutex_unlock(&mutex);
+        std::vector<std::string> tasks_data = elasticsearch.get_cluster_tasks();
+        std::vector<std::string> shards_data = elasticsearch.get_cluster_shards(interval, system_health_check_interval);
         if(debug) {
             if(!cluster_data.empty()) {
                 std::string msg = "Elasticsearch Cluster Stats: " + cluster_data;
-                pthread_mutex_lock(&mutex);
-                    writeToLog(DEBUG, log_file.c_str(), msg.c_str());
-                pthread_mutex_unlock(&mutex);
+                writeToLog(DEBUG, log_file.c_str(), msg.c_str());
             }
             else {
-                pthread_mutex_lock(&mutex);
-                    writeToLog(DEBUG, log_file.c_str(), "No Elasticsearch Cluster Stats");
-                pthread_mutex_unlock(&mutex);
+                writeToLog(DEBUG, log_file.c_str(), "No Elasticsearch Cluster Stats");
             }
 
             if(!node_data.empty()) {
                 std::string msg = "Elasticsearch Node Stats: " + node_data;
-                pthread_mutex_lock(&mutex);
-                    writeToLog(DEBUG, log_file.c_str(), msg.c_str());
-                pthread_mutex_unlock(&mutex);
+                writeToLog(DEBUG, log_file.c_str(), msg.c_str());
             }
             else {
-                pthread_mutex_lock(&mutex);
-                    writeToLog(DEBUG, log_file.c_str(), "No Elasticsearch Node Stats");
-                pthread_mutex_unlock(&mutex);
+                writeToLog(DEBUG, log_file.c_str(), "No Elasticsearch Node Stats");
             }
 
             for(const std::string &index_data: indices_data)
             {
                 std::string msg = "Elasticsearch Index Stats: " + index_data;
-                pthread_mutex_lock(&mutex);
-                    writeToLog(DEBUG, log_file.c_str(), msg.c_str());
-                pthread_mutex_unlock(&mutex);
+                writeToLog(DEBUG, log_file.c_str(), msg.c_str());
+            }
+
+            for(const std::string &task_data: tasks_data)
+            {
+                std::string msg = "Elasticsearch Task Stats: " + task_data;
+                writeToLog(DEBUG, log_file.c_str(), msg.c_str());
+            }
+
+            for(const std::string &shard_data: shards_data)
+            {
+                std::string msg = "Elasticsearch Shard Stats: " + shard_data;
+                writeToLog(DEBUG, log_file.c_str(), msg.c_str());
             }
         }
 
-        pthread_mutex_lock(&mutex);
-            // send data to elasticsearch
-            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, node_data, log_file.c_str());
-            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, cluster_data, log_file.c_str());
-            for(std::string &index_data: indices_data)
-                sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, index_data, log_file.c_str());
+        // send data to elasticsearch
+        sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, node_data, log_file.c_str());
+        sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, cluster_data, log_file.c_str());
+        for(std::string &index_data: indices_data)
+            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, index_data, log_file.c_str());
+        for(std::string &task_data: tasks_data)
+            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, task_data, log_file.c_str());
+        for(std::string &shard_data: shards_data)
+            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, shard_data, log_file.c_str());
 
-            // send data to logstash
-            sendDataToLogstash(logstash_address, node_data);
-            sendDataToLogstash(logstash_address, cluster_data);
-            for(std::string &index_data: indices_data)
-                sendDataToLogstash(logstash_address, index_data);
-        pthread_mutex_unlock(&mutex);
+        // send data to logstash
+        sendDataToLogstash(logstash_address, node_data);
+        sendDataToLogstash(logstash_address, cluster_data);
+        for(std::string &index_data: indices_data)
+            sendDataToLogstash(logstash_address, index_data);
+        for(std::string &task_data: tasks_data)
+            sendDataToLogstash(logstash_address, task_data);
+        for(std::string &shard_data: shards_data)
+            sendDataToLogstash(logstash_address, shard_data);
     }
     catch(const std::runtime_error &error) {
-        pthread_mutex_lock(&mutex);
-            writeToLog(ERROR, log_file.c_str(), error.what());
-        pthread_mutex_unlock(&mutex);
+        writeToLog(ERROR, log_file.c_str(), error.what());
     }
 
     try {
@@ -3162,29 +3291,21 @@ void *Main(void *arg)
         if(debug) {
             if(!logstash_data.empty()) {
                 std::string msg = "Logstash Stats: " + logstash_data;
-                pthread_mutex_lock(&mutex);
-                    writeToLog(DEBUG, log_file.c_str(), msg.c_str());
-                pthread_mutex_unlock(&mutex);
+                writeToLog(DEBUG, log_file.c_str(), msg.c_str());
             }
             else {
-                pthread_mutex_lock(&mutex);
-                    writeToLog(DEBUG, log_file.c_str(), "No Logstash Stats");
-                pthread_mutex_unlock(&mutex);
+                writeToLog(DEBUG, log_file.c_str(), "No Logstash Stats");
             }
         }
 
-        pthread_mutex_lock(&mutex);
-            // send data to elasticsearch
-            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, logstash_data, log_file.c_str());
+        // send data to elasticsearch
+        sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, logstash_data, log_file.c_str());
 
-            // send data to logstash
-            sendDataToLogstash(logstash_address, logstash_data);
-        pthread_mutex_unlock(&mutex);
+        // send data to logstash
+        sendDataToLogstash(logstash_address, logstash_data);
     }
     catch(const std::runtime_error &error) {
-        pthread_mutex_lock(&mutex);
-            writeToLog(ERROR, log_file.c_str(), error.what());
-        pthread_mutex_unlock(&mutex);
+        writeToLog(ERROR, log_file.c_str(), error.what());
     }
 
     if(kafka_path != "" && kafka_server_api != "")
@@ -3203,49 +3324,36 @@ void *Main(void *arg)
             for(const auto& data : kafka_stats)
               msg += data + "\n";
 
-            pthread_mutex_lock(&mutex);
-              writeToLog(DEBUG, log_file.c_str(), msg.c_str());
-            pthread_mutex_unlock(&mutex);
+            writeToLog(DEBUG, log_file.c_str(), msg.c_str());
           }
           else
           {
-            pthread_mutex_lock(&mutex);
-              writeToLog(DEBUG, log_file.c_str(), "No Kafka Stats");
-            pthread_mutex_unlock(&mutex);
+            writeToLog(DEBUG, log_file.c_str(), "No Kafka Stats");
           }
         }
-        pthread_mutex_lock(&mutex);
-          for(const auto &data : kafka_stats)
-            sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, data, log_file.c_str());
-        pthread_mutex_unlock(&mutex);
+        for(auto &data : kafka_stats)
+         sendDataToElasticsearch(debug, elasticsearch_address, index_name_now, index_type, base64auth, data, log_file.c_str());
      }
      catch(const std::runtime_error &error)
      {
-       pthread_mutex_lock(&mutex);
         writeToLog(ERROR, log_file.c_str(), error.what());
-      pthread_mutex_unlock(&mutex);
      }
     }
 
     // stop measure
     gettimeofday(&tv2, NULL);
     size_t udiff = (tv2.tv_usec - tv1.tv_usec) + (tv2.tv_sec - tv1.tv_sec) * 1000000;
-    if( (uwait - udiff) <= uwait ) {
-        int sig_caught = 0;
-        size_t elapsed = 0;
-        sigset_t sig_p;
-        // sleep the remaining microseconds of a second
-        double sleep_sec = double(uwait - udiff) / 1000000;
-        usleep( double( sleep_sec - size_t(sleep_sec) ) * 1000000 );
+    if( udiff < uwait ) {
 
-        // sleep in 1s interval to handle signals
-        while(elapsed < (uwait - udiff) / 1000000) {
-            sigpending(&sig_p);
-            if(sigismember(&sig_p, SIGINT) == 1 || sigismember(&sig_p, SIGTERM) == 1) { sig_caught = 1; break; }
-            sleep(1);
-            ++elapsed;
-        }
-        if(sig_caught) break;
+        struct timeval interval_val;
+        interval_val.tv_sec = (uwait - udiff) / 1000000;
+        interval_val.tv_usec = uwait - udiff - interval_val.tv_sec * 1000000;
+
+        // sleep unless signal is delivered
+        struct timespec interval_spec;
+        TIMEVAL_TO_TIMESPEC(&interval_val, &interval_spec);
+        int sig_code = sigtimedwait(&sig, NULL, &interval_spec);
+        if(sig_code == SIGINT || sig_code == SIGTERM) break;
     }
 
     }
@@ -3279,12 +3387,16 @@ void *PSexec(void *arg)
     cf->get_value("debug", debug);
     cf->get_value("logstash_address", logstash_address);
 
-    std::string ps_port, ps_exec_step, ps_path;
+    if(cf->get_time_value("ps_exec_step", ps.exec_step) != 0)
+    {
+        writeToLog(ERROR, log_file.c_str(), "Failed to parse ps_exec_step option. PSexec module not loaded");
+        return NULL;
+    }
+
+    std::string ps_port, ps_path;
     cf->get_value("ps_port", ps_port);
-    cf->get_value("ps_exec_step", ps_exec_step);
     cf->get_value("ps_path", ps_path);
     if(!ps_port.empty()) ps.port = std::stoi(ps_port);
-    if(!ps_exec_step.empty()) ps.exec_step = std::stoi(ps_exec_step);
     if(!ps_path.empty()) ps.path = ps_path.c_str();
 
     FILE *f = fopen(ps.path, "r");
@@ -3296,9 +3408,7 @@ void *PSexec(void *arg)
     if(ps.script == NULL) return NULL;
 
     // Module loaded
-    pthread_mutex_lock(&mutex);
-        writeToLog(INFO, log_file.c_str(), "PSexec module loaded");
-    pthread_mutex_unlock(&mutex);
+    writeToLog(INFO, log_file.c_str(), "PSexec module loaded");
 
     std::string msg;
     msg = "The following settings are used:\n";
@@ -3307,9 +3417,7 @@ void *PSexec(void *arg)
     msg += "PS Path: " + std::string(ps.path) + "\n";
     if(!logstash_address.first.empty()) msg += "Logstash Output - IP: " + logstash_address.first + ", Port: " + std::to_string(logstash_address.second) + "\n";
 
-    pthread_mutex_lock(&mutex);
-        writeToLog(INFO, log_file.c_str(), msg.c_str());
-    pthread_mutex_unlock(&mutex);
+    writeToLog(INFO, log_file.c_str(), msg.c_str());
 
     // ignore sigpipe generated by operations on closed socket
     signal(SIGPIPE, SIG_IGN);
@@ -3332,12 +3440,8 @@ void *PSexec(void *arg)
         if(pthread_sigmask(SIG_BLOCK, &sig, NULL) != 0) return NULL;
 
         msg = "Got connection from " + std::string(inet_ntoa(peer_a.sin_addr));
-        pthread_mutex_lock(&mutex);
-            writeToLog(INFO, log_file.c_str(), msg.c_str());
-        pthread_mutex_unlock(&mutex);
+        writeToLog(INFO, log_file.c_str(), msg.c_str());
         for(;;) {
-            sigset_t sig_p;
-            size_t elapsed = 0;
             sig_caught = 0;
             free(ps.response);
             ps.response = NULL;
@@ -3351,15 +3455,12 @@ void *PSexec(void *arg)
             // send response to logstash
             sendDataToLogstash(logstash_address, ps.response);
 
-            // sleep in 1s interval to handle signals
-            while(elapsed <= ps.exec_step) {
-                sigpending(&sig_p);
-                if(sigismember(&sig_p, SIGINT) == 1 || sigismember(&sig_p, SIGTERM) == 1) { sig_caught = 1; break; }
-                sleep(1);
-                ++elapsed;
-            }
-
-            if(sig_caught) break;
+            // sleep unless signal is delivered
+            struct timespec exec_step;
+            exec_step.tv_sec = ps.exec_step;
+            exec_step.tv_nsec = 0;
+            int sig_code = sigtimedwait(&sig, NULL, &exec_step);
+            if(sig_code == SIGINT || sig_code == SIGTERM) { sig_caught = 1; break; }
         }
 
         // close connection on other end
@@ -3387,7 +3488,7 @@ void printSampleConfig()
     std::cout << "[Global] - applies to all modules" << std::endl;
 
     std::cout << "# path to log file" << std::endl;
-    std::cout << "log_file = /tmp/skimmer.log" << std::endl << std::endl;
+    std::cout << "log_file = /var/log/skimmer/skimmer.log" << std::endl << std::endl;
 
     std::cout << "# enable debug logging" << std::endl;
     std::cout << "# debug = true" << std::endl << std::endl;
@@ -3405,12 +3506,23 @@ void printSampleConfig()
     std::cout << "# user and password to elasticsearch api" << std::endl;
     std::cout << "elasticsearch_auth = logserver:logserver" << std::endl << std::endl;
 
-    std::cout << "# how often (in seconds) to collect stats (lower threshold = 10)" << std::endl;
-    std::cout << "# interval = 60" << std::endl << std::endl;
+    std::cout << "# how often to collect stats (lower threshold = 10s)" << std::endl;
+    std::cout << "# interval = 1min" << std::endl << std::endl;
+
+    std::cout << "# how often to collect shards stats (lower threshold = interval)" << std::endl;
+    std::cout << "# system_health_check_interval = 4h" << std::endl << std::endl;
 
     std::cout << "# available outputs" << std::endl;
     std::cout << "elasticsearch_address = 127.0.0.1:9200" << std::endl;
     std::cout << "# logstash_address = 127.0.0.1:6110" << std::endl << std::endl;
+
+    std::cout << "# retrieve from api" << std::endl;
+    std::cout << "elasticsearch_api = 127.0.0.1:9200" << std::endl;
+    std::cout << "logstash_api = 127.0.0.1:9600" << std::endl << std::endl;
+
+    std::cout << "# monitor individual indices from elasticsearch api" << std::endl;
+    std::cout << "# comma separated list of indices" << std::endl;
+    std::cout << "# indices_stats = *" << std::endl << std::endl;
 
     std::cout << "# monitor kafka" << std::endl;
     std::cout << "# kafka_path = /usr/share/kafka/" << std::endl;
@@ -3422,14 +3534,6 @@ void printSampleConfig()
     std::cout << "# switch to true if you use outdated version of kafka - before v.2.4.0" << std::endl;
     std::cout << "# kafka_outdated_version = false" << std::endl << std::endl;
 
-    std::cout << "# retrieve from api" << std::endl;
-    std::cout << "elasticsearch_api = 127.0.0.1:9200" << std::endl;
-    std::cout << "# logstash_api = 127.0.0.1:9600" << std::endl << std::endl;
-
-    std::cout << "# monitor individual indices from elasticsearch api" << std::endl;
-    std::cout << "# comma separated list of indices" << std::endl;
-    std::cout << "# indices_stats = *" << std::endl << std::endl;
-
     std::cout << "# comma separated OS statistics selected from the list [zombie,vm,fs,swap,net,cpu]" << std::endl;
     std::cout << "os_stats = zombie,vm,fs,swap,net,cpu" << std::endl << std::endl;
 
@@ -3437,24 +3541,24 @@ void printSampleConfig()
     std::cout << "processes = /usr/sbin/sshd,/usr/sbin/rsyslogd" << std::endl << std::endl;
 
     std::cout << "# comma separated systemd services to print their status" << std::endl;
-    std::cout << "systemd_services = elasticsearch,logstash" << std::endl << std::endl;
+    std::cout << "systemd_services = elasticsearch,logstash,alert,cerebro,kibana" << std::endl << std::endl;
 
     std::cout << "# comma separated port numbers to print if address is in use" << std::endl;
-    std::cout << "port_numbers = 9200,9300,9600" << std::endl << std::endl;
+    std::cout << "port_numbers = 9200,9300,9600,5514,5044,443,5601,5602" << std::endl << std::endl;
 
     std::cout << "# path to directory containing files needed to be csv validated" << std::endl;
-    std::cout << "# csv_path = /tmp/csv_dir" << std::endl << std::endl;
+    std::cout << "# csv_path = /opt/skimmer/csv/" << std::endl << std::endl;
 
     std::cout << "[PSexec] - run powershell script remotely (skimmer must be installed on Windows)" << std::endl;
     std::cout << "ps_enabled = false" << std::endl;
     std::cout << "# port used to establish connection" << std::endl;
     std::cout << "# ps_port = 10000" << std::endl << std::endl;
 
-    std::cout << "# how often (in seconds) to execute the script" << std::endl;
-    std::cout << "# ps_exec_step = 60" << std::endl << std::endl;
+    std::cout << "# how often to execute the script" << std::endl;
+    std::cout << "# ps_exec_step = 1min" << std::endl << std::endl;
 
     std::cout << "# path to the script which will be sent and executed on remote end" << std::endl;
-    std::cout << "# ps_path = /tmp/skimmer.ps1" << std::endl << std::endl;
+    std::cout << "# ps_path = /opt/skimmer/skimmer.ps1" << std::endl << std::endl;
 
     std::cout << "# available outputs" << std::endl;
     std::cout << "# ps_logstash_address = 127.0.0.1:6111" << std::endl;
@@ -3498,7 +3602,8 @@ int main(int argc, char *argv[])
 
     // get config filename
     const char *filename = NULL;
-    if((filename = readArgs(argc, argv)) == NULL) return -1;
+    // do not return an error code here please
+    if((filename = readArgs(argc, argv)) == NULL) return 0;
 
     // read config file
     std::string err;
@@ -3518,10 +3623,6 @@ int main(int argc, char *argv[])
     if(!ofs.good()) { std::cerr << "Could not open log file for writing" << std::endl; return -1; }
     ofs.close();
 
-    // logging
-    std::string msg = "Skimmer version " + std::string(VERSION) + " started\n";
-    writeToLog(INFO, log_file.c_str(), msg.c_str());
-
     // block SIGINT && SIGTERM
     sigset_t sig;
     sigemptyset(&sig);
@@ -3531,6 +3632,10 @@ int main(int argc, char *argv[])
 
     // init mutex
     pthread_mutex_init(&mutex, NULL);
+
+    // logging
+    std::string msg = "Skimmer version " + std::string(VERSION) + " started\n";
+    writeToLog(INFO, log_file.c_str(), msg.c_str());
 
     // Main module
     pthread_create(&threads[0], NULL, Main, (void *) &cf);
@@ -3542,6 +3647,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < MODULES; i++)
         pthread_join(threads[i], NULL);
 
+    // cleanup
     pthread_mutex_destroy(&mutex);
 
     return 0;
